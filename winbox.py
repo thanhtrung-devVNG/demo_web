@@ -38,13 +38,6 @@ except ImportError:
     subprocess.run([sys.executable, "-m", "pip", "install", "requests", "-q"], check=True)
     import requests
 
-try:
-    import psutil
-except ImportError:
-    print("[ERROR] psutil chưa được cài đặt. Đang tiến hành cài đặt...")
-    subprocess.run([sys.executable, "-m", "pip", "install", "psutil", "-q"], check=True)
-    import psutil
-
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
 
@@ -154,8 +147,7 @@ def get_nodes():
             "port": WORKER_PORT,
             "type": "local",
             "enabled": True,
-            "token": "",
-            "max_vms": 0
+            "token": ""
         }
     }
     nodes = load_json(NODES_FILE)
@@ -198,99 +190,10 @@ def get_node_status(node):
             timeout=5
         )
         if r.status_code == 200:
-            data = r.json()
-            # Đảm bảo các key số luôn có giá trị, không phải None
-            for key in ["cpu_count", "cpu_percent", "ram_total_gb", "ram_used_gb", "ram_percent", "disk_total_gb", "disk_used_gb", "disk_percent"]:
-                if data.get(key) is None:
-                    data[key] = 0
-            return data
+            return r.json()
     except Exception:
         pass
-    return {"success": False, "online": False, "cpu_count": 0, "cpu_percent": 0, "ram_total_gb": 0, "ram_percent": 0, "disk_total_gb": 0, "disk_percent": 0}
-
-def get_vm_count_on_node(node_id):
-    """Đếm số VM đang tồn tại trên một node (bao gồm cả stopped)."""
-    count = 0
-    users = load_all_users()
-    for uid in users:
-        vms = get_user_vms(uid)
-        for vid, vm in vms.items():
-            if vm.get("node_id", "local") == node_id:
-                count += 1
-    return count
-
-def check_node_can_fit(node_id, config):
-    """Kiểm tra node có đủ tài nguyên và chưa đạt giới hạn VM không."""
-    nodes = get_nodes()
-    node = nodes.get(node_id)
-    if not node:
-        return False, "Node không tồn tại trong hệ thống."
-    if not node.get("enabled", True):
-        return False, "Node đang bị tắt."
-
-    # Kiểm tra giới hạn số VM (Admin giới hạn)
-    max_vms = node.get("max_vms", 0)
-    if max_vms > 0:
-        current = get_vm_count_on_node(node_id)
-        if current >= max_vms:
-            return False, f"Node đã đạt giới hạn {max_vms} VM do Admin thiết lập (hiện có {current})."
-
-    # Lấy status real-time (không dùng _status cache)
-    if node_id == "local":
-        status = get_local_resources()
-    else:
-        status = get_node_status(node)
-
-    if status.get("success"):
-        cpu_percent = status.get("cpu_percent", 0) or 0
-        ram_percent = status.get("ram_percent", 0) or 0
-        disk_percent = status.get("disk_percent", 0) or 0
-
-        # Nếu node đang quá tải → khóa
-        if cpu_percent > 90 or ram_percent > 90 or disk_percent > 95:
-            return False, f"Node đang quá tải (CPU {cpu_percent}%, RAM {ram_percent}%, Disk {disk_percent}%). Vui lòng chọn node khác."
-
-        # Kiểm tra cấu hình VM có vượt quá tổng tài nguyên node không
-        cpu_total = status.get("cpu_count", 0) or 0
-        ram_total = status.get("ram_total_gb", 0) or 0
-        disk_total = status.get("disk_total_gb", 0) or 0
-
-        vm_cpu = config.get("cpu", 0)
-        vm_ram = config.get("ram", 0)
-        vm_disk = config.get("disk", 0)
-
-        if cpu_total and vm_cpu > cpu_total:
-            return False, f"Cấu hình CPU ({vm_cpu} core) vượt quá tổng CPU của node ({cpu_total} core)."
-        if ram_total and vm_ram > ram_total:
-            return False, f"Cấu hình RAM ({vm_ram}GB) vượt quá tổng RAM của node ({ram_total}GB)."
-        if disk_total and vm_disk > disk_total:
-            return False, f"Cấu hình Disk ({vm_disk}GB) vượt quá tổng Disk của node ({disk_total}GB)."
-
-    return True, "OK"
-
-def get_local_resources():
-    """Lấy tài nguyên máy local (Master)."""
-    try:
-        import psutil
-        cpu_count = psutil.cpu_count() or 0
-        mem = psutil.virtual_memory()
-        disk = psutil.disk_usage("/")
-        return {
-            "success": True,
-            "online": True,
-            "cpu_count": cpu_count,
-            "cpu_percent": psutil.cpu_percent(interval=0.5) or 0,
-            "ram_total_gb": round(mem.total / (1024**3), 2) if mem.total else 0,
-            "ram_used_gb": round(mem.used / (1024**3), 2) if mem.used else 0,
-            "ram_percent": mem.percent if mem.percent is not None else 0,
-            "disk_total_gb": round(disk.total / (1024**3), 2) if disk.total else 0,
-            "disk_used_gb": round(disk.used / (1024**3), 2) if disk.used else 0,
-            "disk_percent": disk.percent if disk.percent is not None else 0
-        }
-    except ImportError:
-        return {"success": True, "online": True, "note": "psutil not installed", "cpu_count": 0, "cpu_percent": 0, "ram_total_gb": 0, "ram_percent": 0, "disk_total_gb": 0, "disk_percent": 0}
-    except Exception as e:
-        return {"success": False, "online": True, "error": str(e), "cpu_count": 0, "cpu_percent": 0, "ram_total_gb": 0, "ram_percent": 0, "disk_total_gb": 0, "disk_percent": 0}
+    return {"success": False, "online": False}
 
 def append_vm_log(user_id, vm_id, text):
     log_path = get_vm_log_path(user_id, vm_id)
@@ -311,7 +214,8 @@ def get_settings():
         "primary_color": "#2196F3",
         "allow_registration": True,
         "default_logs_locked": True,
-        "maintenance_mode": False
+        "maintenance_mode": False,
+        "marketplace_cleanup_minutes": 2
     }
     s = load_json(SETTINGS_FILE)
     for k, v in defaults.items():
@@ -324,13 +228,13 @@ def save_settings(data):
 
 # ==================== CONFIGS & OS DATA ====================
 DEFAULT_VM_CONFIGS = {
-    "basic": {"name": "Basic", "cpu": 1, "ram": 1, "disk": 15, "price_hourly": 5000, "price_daily": 35000, "price_monthly": 100000},
-    "standard": {"name": "Standard", "cpu": 2, "ram": 4, "disk": 60, "price_hourly": 15000, "price_daily": 100000, "price_monthly": 300000},
-    "pro": {"name": "Pro", "cpu": 4, "ram": 8, "disk": 120, "price_hourly": 30000, "price_daily": 200000, "price_monthly": 600000},
-    "enterprise": {"name": "Enterprise", "cpu": 8, "ram": 16, "disk": 250, "price_hourly": 60000, "price_daily": 400000, "price_monthly": 1200000},
-    "ultra": {"name": "Ultra", "cpu": 16, "ram": 32, "disk": 500, "price_hourly": 120000, "price_daily": 800000, "price_monthly": 2400000},
-    "super": {"name": "Super", "cpu": 32, "ram": 64, "disk": 1000, "price_hourly": 240000, "price_daily": 1600000, "price_monthly": 4800000},
-    "mega": {"name": "Mega", "cpu": 64, "ram": 128, "disk": 2000, "price_hourly": 480000, "price_daily": 3200000, "price_monthly": 9600000},
+    "basic": {"name": "Basic", "cpu": 1, "ram": 1, "disk": 15, "price_minutely": 200, "price_hourly": 5000, "price_daily": 35000, "price_weekly": 200000, "price_monthly": 100000},
+    "standard": {"name": "Standard", "cpu": 2, "ram": 4, "disk": 60, "price_minutely": 500, "price_hourly": 15000, "price_daily": 100000, "price_weekly": 600000, "price_monthly": 300000},
+    "pro": {"name": "Pro", "cpu": 4, "ram": 8, "disk": 120, "price_minutely": 1000, "price_hourly": 30000, "price_daily": 200000, "price_weekly": 1200000, "price_monthly": 600000},
+    "enterprise": {"name": "Enterprise", "cpu": 8, "ram": 16, "disk": 250, "price_minutely": 2000, "price_hourly": 60000, "price_daily": 400000, "price_weekly": 2400000, "price_monthly": 1200000},
+    "ultra": {"name": "Ultra", "cpu": 16, "ram": 32, "disk": 500, "price_minutely": 4000, "price_hourly": 120000, "price_daily": 800000, "price_weekly": 4800000, "price_monthly": 2400000},
+    "super": {"name": "Super", "cpu": 32, "ram": 64, "disk": 1000, "price_minutely": 8000, "price_hourly": 240000, "price_daily": 1600000, "price_weekly": 9600000, "price_monthly": 4800000},
+    "mega": {"name": "Mega", "cpu": 64, "ram": 128, "disk": 2000, "price_minutely": 16000, "price_hourly": 480000, "price_daily": 3200000, "price_weekly": 19200000, "price_monthly": 9600000},
 }
 
 DEFAULT_WINDOWS_IMAGES = {
@@ -353,6 +257,11 @@ def get_vm_configs():
     if not configs:
         configs = DEFAULT_VM_CONFIGS
         save_json(CONFIGS_FILE, configs)
+    # backward compat: đảm bảo mỗi config có đủ 5 giá
+    for k, cfg in configs.items():
+        for price_key in ("price_minutely", "price_hourly", "price_daily", "price_weekly", "price_monthly"):
+            if price_key not in cfg:
+                cfg[price_key] = 0
     return configs
 
 def get_windows_images():
@@ -502,14 +411,196 @@ def find_and_kill_qemu_for_vm(vm_dir):
         pass
     return killed_any
 
-def _restart_tailscale(user_id, vm_id, tailscale_key, vm_dir):
-    """Chạy lại tailscale sau khi VM restart để lấy IP."""
+def _check_qemu_running(vm_dir):
+    """Kiểm tra xem còn process QEMU nào liên quan đến vm_dir không."""
+    vm_dir_str = str(vm_dir)
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", f"qemu.*{re.escape(vm_dir_str)}"],
+            capture_output=True, text=True
+        )
+        if result.stdout.strip():
+            return True
+    except Exception:
+        pass
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", f"qemu.*{re.escape(vm_dir.name)}"],
+            capture_output=True, text=True
+        )
+        if result.stdout.strip():
+            return True
+    except Exception:
+        pass
+    try:
+        result = subprocess.run(["pgrep", "qemu"], capture_output=True, text=True)
+        if result.stdout.strip():
+            return True
+    except Exception:
+        pass
+    return False
+
+def _stop_vm_logged(user_id, vm_id, vm_dir):
+    """Dừng VM với pkill, check, fallback kill -9, log đầy đủ."""
+    append_vm_log(user_id, vm_id, "==========================================================")
+    append_vm_log(user_id, vm_id, "[STOP] BẮT ĐẦU DỪNG VM")
+    append_vm_log(user_id, vm_id, "==========================================================")
+    append_vm_log(user_id, vm_id, "[STOP] STEP 1: Gửi lệnh pkill qemu và sudo pkill qemu...")
+
+    try:
+        subprocess.run(["pkill", "qemu"], capture_output=True, text=True)
+        append_vm_log(user_id, vm_id, "[STOP] Đã gửi: pkill qemu")
+    except Exception as e:
+        append_vm_log(user_id, vm_id, f"[STOP] Lỗi pkill qemu: {e}")
+    try:
+        subprocess.run(["sudo", "pkill", "qemu"], capture_output=True, text=True)
+        append_vm_log(user_id, vm_id, "[STOP] Đã gửi: sudo pkill qemu")
+    except Exception as e:
+        append_vm_log(user_id, vm_id, f"[STOP] Lỗi sudo pkill qemu: {e}")
+
+    append_vm_log(user_id, vm_id, "[STOP] Đang chờ 2 giây để QEMU tắt...")
+    time.sleep(2)
+
+    if _check_qemu_running(vm_dir):
+        append_vm_log(user_id, vm_id, "[STOP] CẢNH BÁO: QEMU vẫn còn chạy! Dùng pkill -9...")
+        try:
+            subprocess.run(["pkill", "-9", "qemu"], capture_output=True, text=True)
+            append_vm_log(user_id, vm_id, "[STOP] Đã gửi: pkill -9 qemu")
+        except Exception as e:
+            append_vm_log(user_id, vm_id, f"[STOP] Lỗi pkill -9 qemu: {e}")
+        try:
+            subprocess.run(["sudo", "pkill", "-9", "qemu"], capture_output=True, text=True)
+            append_vm_log(user_id, vm_id, "[STOP] Đã gửi: sudo pkill -9 qemu")
+        except Exception as e:
+            append_vm_log(user_id, vm_id, f"[STOP] Lỗi sudo pkill -9 qemu: {e}")
+
+        append_vm_log(user_id, vm_id, "[STOP] Đang chờ thêm 2 giây...")
+        time.sleep(2)
+
+        if _check_qemu_running(vm_dir):
+            append_vm_log(user_id, vm_id, "[STOP] CẢNH BÁO: QEMU vẫn còn! Thử kill trực tiếp bằng PID...")
+            try:
+                result = subprocess.run(["pgrep", "-f", f"qemu.*{re.escape(str(vm_dir))}"],
+                                        capture_output=True, text=True)
+                for pid in result.stdout.strip().split("\n"):
+                    if pid.strip():
+                        try:
+                            subprocess.run(["kill", "-9", pid.strip()], capture_output=True, text=True)
+                            append_vm_log(user_id, vm_id, f"[STOP] Đã kill -9 PID {pid.strip()}")
+                        except Exception as ke:
+                            append_vm_log(user_id, vm_id, f"[STOP] Lỗi kill -9 PID {pid.strip()}: {ke}")
+            except Exception as e:
+                append_vm_log(user_id, vm_id, f"[STOP] Lỗi lấy PID: {e}")
+
+            time.sleep(1)
+            if _check_qemu_running(vm_dir):
+                append_vm_log(user_id, vm_id, "[STOP] KHÔNG THỂ TẮT QEMU! Có thể cần reboot server.")
+            else:
+                append_vm_log(user_id, vm_id, "[STOP] QEMU đã tắt sau kill -9 trực tiếp.")
+        else:
+            append_vm_log(user_id, vm_id, "[STOP] QEMU đã tắt sau pkill -9.")
+    else:
+        append_vm_log(user_id, vm_id, "[STOP] QEMU đã tắt thành công sau pkill.")
+
+    with vm_lock:
+        if vm_id in active_vms and active_vms[vm_id].get("process"):
+            try:
+                active_vms[vm_id]["process"].terminate()
+                active_vms[vm_id]["process"].wait(timeout=3)
+            except Exception:
+                try:
+                    active_vms[vm_id]["process"].kill()
+                except Exception:
+                    pass
+        if vm_id in active_vms:
+            active_vms[vm_id]["status"] = "stopped"
+    append_vm_log(user_id, vm_id, "[STOP] Đã cập nhật trạng thái VM thành STOPPED.")
+    append_vm_log(user_id, vm_id, "==========================================================")
+
+def _delete_vm_logged(user_id, vm_id, vm_dir, windows_key="win11"):
+    """Xóa VM: chạy script với option 3, sau đó xóa thư mục, log đầy đủ."""
+    append_vm_log(user_id, vm_id, "==========================================================")
+    append_vm_log(user_id, vm_id, "[DELETE] BẮT ĐẦU XÓA VM")
+    append_vm_log(user_id, vm_id, "==========================================================")
+
+    append_vm_log(user_id, vm_id, "[DELETE] STEP 1: TẢI WINBOX SCRIPT ĐỂ XÓA VM")
+    script_url = "https://raw.githubusercontent.com/thanhtrung-devVNG/demo_web/refs/heads/main/winbox.sh"
+    script_path = vm_dir / "win.sh"
+    try:
+        download_proc = subprocess.run(
+            ["wget", "-O", str(script_path), script_url],
+            capture_output=True, text=True, timeout=120
+        )
+        if download_proc.returncode != 0 and not script_path.exists():
+            download_proc = subprocess.run(
+                ["curl", "-fsSL", "-o", str(script_path), script_url],
+                capture_output=True, text=True, timeout=120
+            )
+        if script_path.exists() and script_path.stat().st_size > 1000:
+            os.chmod(script_path, 0o755)
+            append_vm_log(user_id, vm_id, f"[DELETE] Đã tải win.sh ({script_path.stat().st_size} bytes)")
+        else:
+            append_vm_log(user_id, vm_id, "[DELETE] Không tải được win.sh, bỏ qua bước chạy script xóa.")
+            script_path = None
+    except Exception as e:
+        append_vm_log(user_id, vm_id, f"[DELETE] Lỗi tải script: {e}")
+        script_path = None
+
+    if script_path and script_path.exists():
+        append_vm_log(user_id, vm_id, "[DELETE] STEP 2: CHẠY SCRIPT VỚI OPTION 3 (XÓA SẠCH VM)")
+        try:
+            env = os.environ.copy()
+            env["HOME"] = str(vm_dir)
+            env["USER"] = "winbox"
+            env["LOGNAME"] = "winbox"
+            proc = subprocess.Popen(
+                ["bash", str(script_path)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                cwd=str(vm_dir),
+                env=env
+            )
+            proc.stdin.write("3\n")
+            proc.stdin.flush()
+            proc.stdin.close()
+            for line in proc.stdout:
+                line_str = line.strip()
+                append_vm_log(user_id, vm_id, f"[DELETE-SCRIPT] {line_str}")
+            proc.wait()
+            append_vm_log(user_id, vm_id, "[DELETE] Script xóa VM đã chạy xong.")
+        except Exception as e:
+            append_vm_log(user_id, vm_id, f"[DELETE] Lỗi chạy script xóa: {e}")
+
+    append_vm_log(user_id, vm_id, "[DELETE] STEP 3: DỪNG QEMU NẾU CÒN CHẠY")
+    _stop_vm_logged(user_id, vm_id, vm_dir)
+
+    append_vm_log(user_id, vm_id, "[DELETE] STEP 4: XÓA THƯ MỤC VM")
+    try:
+        with vm_lock:
+            active_vms.pop(vm_id, None)
+        if vm_dir.exists():
+            shutil.rmtree(vm_dir, ignore_errors=True)
+        append_vm_log(user_id, vm_id, "[DELETE] Đã xóa toàn bộ dữ liệu VM.")
+    except Exception as e:
+        append_vm_log(user_id, vm_id, f"[DELETE] Lỗi xóa thư mục: {e}")
+
+    append_vm_log(user_id, vm_id, "[DELETE] QUÁ TRÌNH XÓA VM HOÀN TẤT.")
+    append_vm_log(user_id, vm_id, "==========================================================")
+
+def _tailscale_worker(user_id, vm_id, tailscale_key, vm_dir):
+    """Chạy tailscale trong thread riêng, parse IP và cập nhật ngay lập tức."""
     if not tailscale_key:
+        append_vm_log(user_id, vm_id, "[TAILSCALE] Không có Auth Key, bỏ qua.")
         return
     ts_script = vm_dir / "install_tailscale.sh"
     with open(ts_script, "w", encoding="utf-8") as f:
         f.write(TAILSCALE_SCRIPT)
     os.chmod(ts_script, 0o755)
+    append_vm_log(user_id, vm_id, "==========================================================")
+    append_vm_log(user_id, vm_id, "[TAILSCALE] Đang khởi động Tailscale song song với QEMU...")
+    append_vm_log(user_id, vm_id, "==========================================================")
     try:
         ts_process = subprocess.Popen(
             ["bash", str(ts_script), tailscale_key],
@@ -531,27 +622,52 @@ def _restart_tailscale(user_id, vm_id, tailscale_key, vm_dir):
                 if vm_data:
                     vm_data["tailscale_ip"] = ts_ip
                     save_vm_data(user_id, vm_id, vm_data)
+                    append_vm_log(user_id, vm_id, f"[TAILSCALE] IP đã cập nhật: {ts_ip}")
         ts_process.wait()
+        append_vm_log(user_id, vm_id, "[TAILSCALE] Tiến trình Tailscale đã kết thúc.")
     except Exception as e:
         append_vm_log(user_id, vm_id, f"[TAILSCALE] Lỗi cài đặt Tailscale: {e}")
 
 
 def start_vm_existing(user_id, vm_id, config, vm_dir, vm_name, windows_key, tailscale_key):
     """
-    Khởi động lại VM bằng cách dùng lại script winbox.sh đã tải.
-    Y hệt lúc tạo VM, chỉ khác KHÔNG resize disk và KHÔNG tải lại script.
+    Khởi động lại VM bằng cách tải lại script win.sh và chạy lại.
+    Giống như tạo VM mới, nhưng KHÔNG resize disk.
     """
-    win_img = vm_dir / "win.img"
-    if not win_img.exists():
-        return False, "File disk win.img không tồn tại. Không thể khởi động lại."
+    append_vm_log(user_id, vm_id, "==========================================================")
+    append_vm_log(user_id, vm_id, "[START] BẮT ĐẦU KHỞI ĐỘNG LẠI VM")
+    append_vm_log(user_id, vm_id, "==========================================================")
+    append_vm_log(user_id, vm_id, "[START] STEP 1: TẢI LẠI WINBOX SCRIPT")
 
-    script_path = vm_dir / "trungngu.sh"
-    if not script_path.exists():
-        script_path = vm_dir / "winbox.sh"
-    if not script_path.exists():
-        return False, "Không tìm thấy script winbox.sh/trungngu.sh trong thư mục VM. Không thể khởi động lại."
+    script_url = "https://raw.githubusercontent.com/thanhtrung-devVNG/demo_web/refs/heads/main/winbox.sh"
+    script_path = vm_dir / "win.sh"
+    try:
+        download_proc = subprocess.run(
+            ["wget", "-O", str(script_path), script_url],
+            capture_output=True, text=True, timeout=120
+        )
+        if download_proc.returncode != 0 and not script_path.exists():
+            download_proc = subprocess.run(
+                ["curl", "-fsSL", "-o", str(script_path), script_url],
+                capture_output=True, text=True, timeout=120
+            )
+        if script_path.exists() and script_path.stat().st_size > 1000:
+            os.chmod(script_path, 0o755)
+            append_vm_log(user_id, vm_id, f"[START] Đã tải lại win.sh ({script_path.stat().st_size} bytes)")
+        else:
+            append_vm_log(user_id, vm_id, "[START] CẢNH BÁO: Không tải được win.sh, thử dùng script cũ...")
+            old_script = vm_dir / "win.sh"
+            if not old_script.exists():
+                old_script = vm_dir / "win.sh"
+            if old_script.exists():
+                script_path = old_script
+            else:
+                return False, "Không tìm thấy script nào để khởi động lại VM."
+    except Exception as e:
+        append_vm_log(user_id, vm_id, f"[START] Lỗi tải script: {e}")
+        return False, f"Lỗi tải script: {e}"
 
-    # Chuẩn bị tham số y hệt lúc tạo VM
+    append_vm_log(user_id, vm_id, "[START] STEP 2: CHUẨN BỊ THAM SỐ TỰ ĐỘNG CHO SCRIPT")
     WIN_FLAG_MAP = {
         "win2012": "--win2012",
         "win2022": "--win2022",
@@ -582,12 +698,9 @@ def start_vm_existing(user_id, vm_id, config, vm_dir, vm_name, windows_key, tail
     env["USER"] = "winbox"
     env["LOGNAME"] = "winbox"
 
-    append_vm_log(user_id, vm_id, "[INIT] Bắt đầu khởi động lại VM trên Worker Node...")
-    append_vm_log(user_id, vm_id, "==========================================================")
-    append_vm_log(user_id, vm_id, f"[RESTART] Khởi động lại VM {vm_name} bằng script winbox.sh")
-    append_vm_log(user_id, vm_id, f"[RESTART] Cấu hình: {config.get('name', 'Custom')} ({config.get('cpu', 2)} vCPU, {config.get('ram', 4)} GB RAM, {config.get('disk', 15)} GB Disk)")
-    append_vm_log(user_id, vm_id, f"[RESTART] Hệ điều hành: {windows_key} ({win_flag})")
-    append_vm_log(user_id, vm_id, f"[RESTART] KHÔNG resize disk - giữ nguyên dung lượng hiện tại")
+    append_vm_log(user_id, vm_id, f"[START] Cấu hình: {config.get('name', 'Custom')} ({config.get('cpu', 2)} vCPU, {config.get('ram', 4)} GB RAM, {config.get('disk', 15)} GB Disk)")
+    append_vm_log(user_id, vm_id, f"[START] Hệ điều hành: {windows_key} ({win_flag})")
+    append_vm_log(user_id, vm_id, "[START] KHÔNG resize disk - giữ nguyên dung lượng hiện tại")
     append_vm_log(user_id, vm_id, "----------------------------------------------------------")
 
     try:
@@ -618,25 +731,31 @@ def start_vm_existing(user_id, vm_id, config, vm_dir, vm_name, windows_key, tail
             vm_data["status"] = "running"
             save_vm_data(user_id, vm_id, vm_data)
 
-        # Background thread để log output và chạy tailscale khi VM kết thúc
-        def _log_and_tailscale_worker():
+        # Chạy tailscale song song ngay lập tức
+        ts_thread = threading.Thread(
+            target=_tailscale_worker,
+            args=(user_id, vm_id, tailscale_key or old_data.get("tailscale_key"), vm_dir),
+            daemon=True
+        )
+        ts_thread.start()
+
+        def _log_worker():
             for line in process.stdout:
                 line_str = line.strip()
                 append_vm_log(user_id, vm_id, line_str)
             process.wait()
-            append_vm_log(user_id, vm_id, "[RESTART] Tiến trình VM đã kết thúc.")
-            # Chạy lại tailscale để lấy IP mới
-            _restart_tailscale(user_id, vm_id, tailscale_key or old_data.get("tailscale_key"), vm_dir)
+            append_vm_log(user_id, vm_id, "[START] Tiến trình QEMU đã kết thúc.")
 
-        t = threading.Thread(target=_log_and_tailscale_worker, daemon=True)
+        t = threading.Thread(target=_log_worker, daemon=True)
         t.start()
 
-        return True, f"VM đã được khởi động lại bằng winbox.sh (KHÔNG resize disk)"
+        return True, "VM đã được khởi động lại bằng win.sh (KHÔNG resize disk)"
     except Exception as e:
         return False, f"Lỗi khởi động lại VM: {e}"
 
+
 # ==================== VM RUNNER ====================
-def run_winbox_script(user_id, vm_id, config, win_img, tailscale_key, vm_name, windows_key="win11", node_id="local"):
+def run_winbox_script(user_id, vm_id, config, win_img, tailscale_key, vm_name, windows_key="win11"):
     if isinstance(config, str):
         configs = get_vm_configs()
         config = configs.get(config, list(configs.values())[0])
@@ -659,13 +778,11 @@ def run_winbox_script(user_id, vm_id, config, win_img, tailscale_key, vm_name, w
         }
     def log_append(text):
         append_vm_log(user_id, vm_id, text)
-    # Đảm bảo file logs được tạo ngay
-    log_append("[INIT] Bắt đầu khởi tạo VM trên Worker Node...")
     log_append("==========================================================")
     log_append("STEP 1: TẢI WINBOXES STABLE SCRIPT")
     log_append("==========================================================")
     script_url = "https://raw.githubusercontent.com/thanhtrung-devVNG/demo_web/refs/heads/main/winbox.sh"
-    script_path = vm_dir / "trungngu.sh"
+    script_path = vm_dir / "win.sh"
     try:
         download_proc = subprocess.run(
             ["wget", "-O", str(script_path), script_url],
@@ -771,68 +888,58 @@ def run_winbox_script(user_id, vm_id, config, win_img, tailscale_key, vm_name, w
         if vm_id in active_vms:
             active_vms[vm_id]["process"] = process
             active_vms[vm_id]["status"] = "running"
-    vm_data = get_vm_data(user_id, vm_id) or {}
-    vm_data["status"] = "running"
-    save_vm_data(user_id, vm_id, vm_data)
+    vm_data = get_vm_data(user_id, vm_id)
+    if vm_data:
+        vm_data["status"] = "running"
+        save_vm_data(user_id, vm_id, vm_data)
+    # Chạy tailscale song song ngay lập tức (không chờ QEMU kết thúc)
+    ts_thread = threading.Thread(
+        target=_tailscale_worker,
+        args=(user_id, vm_id, tailscale_key, vm_dir),
+        daemon=True
+    )
+    ts_thread.start()
+
+    # Thread chính đọc log QEMU
     for line in process.stdout:
         line_str = line.strip()
         log_append(line_str)
     process.wait()
     log_append("==========================================================")
-    log_append("STEP 3: CÀI ĐẶT & KẾT NỐI TAILSCALE LẤY IP")
-    log_append("==========================================================")
-    ts_script = vm_dir / "install_tailscale.sh"
-    with open(ts_script, "w", encoding="utf-8") as f:
-        f.write(TAILSCALE_SCRIPT)
-    os.chmod(ts_script, 0o755)
-    try:
-        ts_process = subprocess.Popen(
-            ["bash", str(ts_script), tailscale_key],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            cwd=str(vm_dir)
-        )
-        for line in ts_process.stdout:
-            line_str = line.strip()
-            log_append(f"[TAILSCALE] {line_str}")
-            ip_match = re.search(r'Tailscale IP: ([0-9.]+)', line_str)
-            if ip_match:
-                ts_ip = ip_match.group(1)
-                with vm_lock:
-                    if vm_id in active_vms:
-                        active_vms[vm_id]["tailscale_ip"] = ts_ip
-                vm_data = get_vm_data(user_id, vm_id)
-                if vm_data:
-                    vm_data["tailscale_ip"] = ts_ip
-                    save_vm_data(user_id, vm_id, vm_data)
-        ts_process.wait()
-    except Exception as e:
-        log_append(f"Lỗi cài đặt Tailscale: {e}")
+    log_append("[SYSTEM] QEMU process đã kết thúc.")
 
 # ==================== BILLING HELPERS ====================
 def get_price_for_cycle(config, cycle):
-    if cycle == "hourly":
-        return config.get("price_hourly", 0)
-    elif cycle == "daily":
-        return config.get("price_daily", 0)
-    else:
-        return config.get("price_monthly", 0)
+    mapping = {
+        "minutely": "price_minutely",
+        "hourly": "price_hourly",
+        "daily": "price_daily",
+        "weekly": "price_weekly",
+        "monthly": "price_monthly"
+    }
+    return config.get(mapping.get(cycle, "price_monthly"), 0)
 
-def calculate_expiry(cycle):
+def calculate_expiry(cycle, duration=1):
     now = datetime.now()
-    if cycle == "hourly":
-        return now + timedelta(hours=1)
+    dur = max(1, int(duration))
+    if cycle == "minutely":
+        return now + timedelta(minutes=dur)
+    elif cycle == "hourly":
+        return now + timedelta(hours=dur)
     elif cycle == "daily":
-        return now + timedelta(days=1)
-    else:
-        return now + timedelta(days=30)
+        return now + timedelta(days=dur)
+    elif cycle == "weekly":
+        return now + timedelta(weeks=dur)
+    else:  # monthly
+        return now + timedelta(days=30*dur)
 
 # ==================== MARKETPLACE CLEANUP ====================
 def cleanup_marketplace():
     market_data = load_json(MARKETPLACE_FILE)
+    keys_data = load_json(KEYS_FILE)
     current_time = time.time()
     updated = False
+    # 1. Cleanup VPS items (hết hàng sau 2 phút mặc định)
     to_delete = []
     for item_id, item in market_data.items():
         if item.get("quantity", 0) <= 0:
@@ -842,8 +949,46 @@ def cleanup_marketplace():
                 updated = True
     for item_id in to_delete:
         del market_data[item_id]
+    # 2. Cleanup Keys đã BÁN HẾT trên Shop → gỡ khỏi shop (dùng shop_grace_minutes)
+    keys_to_unshop = []
+    for k_code, k in keys_data.items():
+        if k.get("on_shop") and k.get("used"):
+            sold_out_at = k.get("sold_out_at")
+            grace = max(1, k.get("shop_grace_minutes", 2)) * 60
+            if sold_out_at and (current_time - sold_out_at > grace):
+                keys_to_unshop.append(k_code)
+                updated = True
+    for k_code in keys_to_unshop:
+        keys_data[k_code]["on_shop"] = False
+    # 3. Cleanup Keys đã ĐƯỢC NHẬP (redeemed) → XÓA HOÀN TOÀN (dùng key_lifetime_minutes)
+    keys_to_delete = []
+    for k_code, k in keys_data.items():
+        redeemed_at = k.get("redeemed_at")
+        if redeemed_at:
+            lifetime = max(1, k.get("key_lifetime_minutes", 60)) * 60
+            if current_time - redeemed_at > lifetime:
+                keys_to_delete.append(k_code)
+                updated = True
+    for k_code in keys_to_delete:
+        del keys_data[k_code]
+    # 4. Cleanup Keys đã HẾT HẠN VALIDITY (từ lúc tạo) → XÓA HOÀN TOÀN
+    keys_to_delete_validity = []
+    for k_code, k in keys_data.items():
+        created_at = k.get("created_at")
+        validity_days = int(k.get("key_validity_days", 30) or 30)
+        if created_at:
+            try:
+                created_dt = datetime.fromisoformat(created_at)
+                if datetime.now() > created_dt + timedelta(days=validity_days):
+                    keys_to_delete_validity.append(k_code)
+                    updated = True
+            except Exception:
+                pass
+    for k_code in keys_to_delete_validity:
+        del keys_data[k_code]
     if updated:
         save_json(MARKETPLACE_FILE, market_data)
+        save_json(KEYS_FILE, keys_data)
 
 def marketplace_cleanup_worker():
     while True:
@@ -1251,7 +1396,7 @@ body{font-family:'Inter',sans-serif;background:#f8fafc;color:#1e293b;min-height:
 </div>
 </div>
 <div class="modal-overlay" id="renewModal">
-<div class="modal" style="width:480px">
+<div class="modal" style="width:520px">
 <div class="modal-header">
 <h3><i class="fas fa-sync-alt" style="color:{{ settings.primary_color }}"></i> Gia hạn Máy ảo</h3>
 <div class="modal-close" onclick="closeRenewModal()">&times;</div>
@@ -1259,22 +1404,39 @@ body{font-family:'Inter',sans-serif;background:#f8fafc;color:#1e293b;min-height:
 <form id="renewForm" onsubmit="return renewVM(event)">
 <input type="hidden" name="vm_id" id="renewVmId">
 <div class="form-group">
-<label><i class="fas fa-clock" style="color:{{ settings.primary_color }};margin-right:6px"></i> Chọn chu kỳ gia hạn:</label>
-<div class="cycle-options">
-<div class="cycle-option selected" data-cycle="hourly" onclick="selectRenewCycle(this)">
-<div class="cycle-name"><i class="fas fa-hourglass-half"></i> Theo giờ</div>
+<label><i class="fas fa-clock" style="color:{{ settings.primary_color }};margin-right:6px"></i> Chọn đơn vị gia hạn:</label>
+<div class="cycle-options" style="grid-template-columns:repeat(5,1fr)">
+<div class="cycle-option selected" data-cycle="minutely" onclick="selectRenewCycle(this)">
+<div class="cycle-name"><i class="fas fa-stopwatch"></i> Phút</div>
+<div class="cycle-price" id="renewPriceMinutely">--</div>
+</div>
+<div class="cycle-option" data-cycle="hourly" onclick="selectRenewCycle(this)">
+<div class="cycle-name"><i class="fas fa-hourglass-half"></i> Giờ</div>
 <div class="cycle-price" id="renewPriceHourly">--</div>
 </div>
 <div class="cycle-option" data-cycle="daily" onclick="selectRenewCycle(this)">
-<div class="cycle-name"><i class="fas fa-sun"></i> Theo ngày</div>
+<div class="cycle-name"><i class="fas fa-sun"></i> Ngày</div>
 <div class="cycle-price" id="renewPriceDaily">--</div>
 </div>
+<div class="cycle-option" data-cycle="weekly" onclick="selectRenewCycle(this)">
+<div class="cycle-name"><i class="fas fa-calendar-week"></i> Tuần</div>
+<div class="cycle-price" id="renewPriceWeekly">--</div>
+</div>
 <div class="cycle-option" data-cycle="monthly" onclick="selectRenewCycle(this)">
-<div class="cycle-name"><i class="fas fa-calendar-alt"></i> Theo tháng</div>
+<div class="cycle-name"><i class="fas fa-calendar-alt"></i> Tháng</div>
 <div class="cycle-price" id="renewPriceMonthly">--</div>
 </div>
 </div>
-<input type="hidden" name="billing_cycle" id="selectedRenewCycle" value="hourly">
+<div class="form-group" style="margin-top:12px;display:flex;align-items:center;gap:12px">
+<label style="margin:0;white-space:nowrap;font-weight:600">Số lượng gia hạn:</label>
+<input type="number" id="renewDurationInput" name="duration" value="1" min="1" style="width:100px;padding:10px;border:1px solid #cbd5e1;border-radius:8px;font-size:14px" oninput="updateRenewTotal()">
+<span style="color:#64748b;font-size:13px" id="renewDurationLabel">phút</span>
+</div>
+<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:12px;margin-top:10px;display:flex;justify-content:space-between;align-items:center">
+<span style="font-weight:600;color:#1e293b">Tổng tiền gia hạn:</span>
+<span id="renewTotalDisplay" style="font-size:18px;font-weight:800;color:#2563eb">0 VNĐ</span>
+</div>
+<input type="hidden" name="billing_cycle" id="selectedRenewCycle" value="minutely">
 </div>
 <button type="submit" class="btn-submit" id="renewSubmitBtn"><i class="fas fa-check-circle"></i> Xác nhận Gia hạn</button>
 </form>
@@ -1472,7 +1634,7 @@ body{font-family:'Inter',sans-serif;background:#f8fafc;color:#1e293b;min-height:
 <div class="vm-grid">
 {% if vms %}
 {% for vm in vms %}
-<div class="vm-card">
+<div class="vm-card" data-vm-id="{{ vm.id }}" data-expiry="{{ vm.expiry_time }}" data-name="{{ vm.name }}">
 <div>
 <div class="vm-header">
 <h4><i class="fab fa-windows" style="color:{{ settings.primary_color }};font-size:18px"></i> {{ vm.name }}</h4>
@@ -1499,6 +1661,10 @@ body{font-family:'Inter',sans-serif;background:#f8fafc;color:#1e293b;min-height:
 <span style="color:#d97706;font-size:12px"><i class="fas fa-spinner fa-spin"></i> Đang lấy IP...</span>
 {% endif %}
 </div>
+<div class="vm-info-row countdown-row" style="background:#e0f2fe;padding:6px 10px;border-radius:6px;margin-top:4px;display:none">
+<span><i class="fas fa-clock" style="color:#0284c7"></i> Còn lại:</span>
+<strong class="countdown-text" style="color:#0369a1;font-family:monospace">--</strong>
+</div>
 {% if vm.logs_locked %}
 <div class="logs-locked-badge"><i class="fas fa-lock"></i> Logs đang bị khóa bởi Admin</div>
 {% endif %}
@@ -1511,7 +1677,7 @@ body{font-family:'Inter',sans-serif;background:#f8fafc;color:#1e293b;min-height:
 </div>
 <div class="vm-actions">
 {% if vm.is_expired %}
-<button class="btn-renew" onclick="openRenewModal('{{ vm.id }}', {{ vm.config.price_hourly|default(0) }}, {{ vm.config.price_daily|default(0) }}, {{ vm.config.price_monthly|default(0) }})"><i class="fas fa-sync-alt"></i> Gia hạn</button>
+<button class="btn-renew" onclick="openRenewModal('{{ vm.id }}', {{ vm.config.price_minutely|default(0) }}, {{ vm.config.price_hourly|default(0) }}, {{ vm.config.price_daily|default(0) }}, {{ vm.config.price_weekly|default(0) }}, {{ vm.config.price_monthly|default(0) }})"><i class="fas fa-sync-alt"></i> Gia hạn</button>
 <button class="btn-delete" onclick="deleteVM('{{ vm.id }}')" title="Xóa máy ảo"><i class="fas fa-trash"></i> Xóa VM</button>
 {% else %}
 {% if vm.status == 'stopped' %}
@@ -1570,29 +1736,46 @@ body{font-family:'Inter',sans-serif;background:#f8fafc;color:#1e293b;min-height:
 <div class="config-option" data-config="{{ key }}" onclick="selectConfig(this)">
 <div class="cfg-title"><span>{{ cfg.name }}</span> <i class="fas fa-check-circle" style="color:#2563eb;opacity:0;transition:opacity 0.2s"></i></div>
 <div class="cfg-desc">{{ cfg.cpu }} vCPU • {{ cfg.ram }} GB RAM • {{ cfg.disk }} GB SSD</div>
-<div class="cfg-price" id="price_{{ key }}">{{ cfg.price_hourly|vnd }}/giờ</div>
+<div class="cfg-price" id="price_{{ key }}">{{ cfg.price_minutely|vnd }}/phút</div>
 </div>
 {% endfor %}
 </div>
 <input type="hidden" name="config" id="selectedConfig" value="">
 </div>
 <div class="form-group">
-<label><i class="fas fa-clock" style="color:{{ settings.primary_color }};margin-right:6px"></i> Chọn chu kỳ thuê</label>
-<div class="cycle-options">
-<div class="cycle-option selected" data-cycle="hourly" onclick="selectCycle(this)">
-<div class="cycle-name"><i class="fas fa-hourglass-half"></i> Theo giờ</div>
+<label><i class="fas fa-clock" style="color:{{ settings.primary_color }};margin-right:6px"></i> Chọn đơn vị thuê & Số lượng</label>
+<div class="cycle-options" style="grid-template-columns:repeat(5,1fr)">
+<div class="cycle-option selected" data-cycle="minutely" onclick="selectCycle(this)">
+<div class="cycle-name"><i class="fas fa-stopwatch"></i> Phút</div>
+<div class="cycle-price" id="cyclePriceMinutely">Chọn cấu hình</div>
+</div>
+<div class="cycle-option" data-cycle="hourly" onclick="selectCycle(this)">
+<div class="cycle-name"><i class="fas fa-hourglass-half"></i> Giờ</div>
 <div class="cycle-price" id="cyclePriceHourly">Chọn cấu hình</div>
 </div>
 <div class="cycle-option" data-cycle="daily" onclick="selectCycle(this)">
-<div class="cycle-name"><i class="fas fa-sun"></i> Theo ngày</div>
+<div class="cycle-name"><i class="fas fa-sun"></i> Ngày</div>
 <div class="cycle-price" id="cyclePriceDaily">Chọn cấu hình</div>
 </div>
+<div class="cycle-option" data-cycle="weekly" onclick="selectCycle(this)">
+<div class="cycle-name"><i class="fas fa-calendar-week"></i> Tuần</div>
+<div class="cycle-price" id="cyclePriceWeekly">Chọn cấu hình</div>
+</div>
 <div class="cycle-option" data-cycle="monthly" onclick="selectCycle(this)">
-<div class="cycle-name"><i class="fas fa-calendar-alt"></i> Theo tháng</div>
+<div class="cycle-name"><i class="fas fa-calendar-alt"></i> Tháng</div>
 <div class="cycle-price" id="cyclePriceMonthly">Chọn cấu hình</div>
 </div>
 </div>
-<input type="hidden" name="billing_cycle" id="selectedCycle" value="hourly">
+<div class="form-group" style="margin-top:12px;display:flex;align-items:center;gap:12px">
+<label style="margin:0;white-space:nowrap;font-weight:600">Số lượng thuê:</label>
+<input type="number" id="durationInput" name="duration" value="1" min="1" style="width:100px;padding:10px;border:1px solid #cbd5e1;border-radius:8px;font-size:14px" oninput="updateTotalPrice()">
+<span style="color:#64748b;font-size:13px" id="durationLabel">phút</span>
+</div>
+<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:12px;margin-top:10px;display:flex;justify-content:space-between;align-items:center">
+<span style="font-weight:600;color:#1e293b">Tổng tiền:</span>
+<span id="totalPriceDisplay" style="font-size:18px;font-weight:800;color:#2563eb">0 VNĐ</span>
+</div>
+<input type="hidden" name="billing_cycle" id="selectedCycle" value="minutely">
 </div>
 <div class="form-group">
 <label><i class="fab fa-windows" style="color:{{ settings.primary_color }};margin-right:6px"></i> Chọn hệ điều hành Windows</label>
@@ -1610,14 +1793,12 @@ body{font-family:'Inter',sans-serif;background:#f8fafc;color:#1e293b;min-height:
 <label><i class="fas fa-server" style="color:{{ settings.primary_color }};margin-right:6px"></i> Chọn Server chạy VM</label>
 <select name="node_id" id="selectedNode" style="width:100%;padding:11px 14px;border:1px solid #cbd5e1;border-radius:8px;font-size:14px;outline:none;background:#fff;color:#0f172a;">
 {% for node_id, node in nodes.items() %}
-{% if node.enabled and not node.get('_overloaded', False) and not node.get('_full', False) %}
-<option value="{{ node_id }}">{{ node.name }}</option>
-{% elif node.enabled %}
-<option value="{{ node_id }}" disabled style="color:#c62828">🔒 {{ node.name }}</option>
+{% if node.enabled %}
+<option value="{{ node_id }}">{{ node.name }} {% if node.type == 'local' %}(Local){% else %}({{ node.host }}:{{ node.port }}){% endif %}</option>
 {% endif %}
 {% endfor %}
 </select>
-<small style="color:#64748b;font-size:12px;display:block;margin-top:6px"><i class="fas fa-info-circle"></i> Node bị khóa (🔒) do hết tài nguyên hoặc đạt giới hạn VM.</small>
+<small style="color:#64748b;font-size:12px;display:block;margin-top:6px"><i class="fas fa-info-circle"></i> Chọn máy chủ để chạy VM. Có thể chọn Local hoặc Worker Node đã kết nối.</small>
 </div>
 <div class="form-group">
 <label><i class="fas fa-key" style="color:{{ settings.primary_color }};margin-right:6px"></i> Tailscale Auth Key (<span style="color:red">* Bắt buộc</span>)</label>
@@ -1629,7 +1810,7 @@ body{font-family:'Inter',sans-serif;background:#f8fafc;color:#1e293b;min-height:
 </div>
 </div>
 <div class="modal-overlay" id="renewModal">
-<div class="modal" style="width:480px">
+<div class="modal" style="width:520px">
 <div class="modal-header">
 <h3><i class="fas fa-sync-alt" style="color:{{ settings.primary_color }}"></i> Gia hạn Máy ảo</h3>
 <div class="modal-close" onclick="closeRenewModal()">&times;</div>
@@ -1637,22 +1818,39 @@ body{font-family:'Inter',sans-serif;background:#f8fafc;color:#1e293b;min-height:
 <form id="renewForm" onsubmit="return renewVM(event)">
 <input type="hidden" name="vm_id" id="renewVmId">
 <div class="form-group">
-<label><i class="fas fa-clock" style="color:{{ settings.primary_color }};margin-right:6px"></i> Chọn chu kỳ gia hạn:</label>
-<div class="cycle-options">
-<div class="cycle-option selected" data-cycle="hourly" onclick="selectRenewCycle(this)">
-<div class="cycle-name"><i class="fas fa-hourglass-half"></i> Theo giờ</div>
+<label><i class="fas fa-clock" style="color:{{ settings.primary_color }};margin-right:6px"></i> Chọn đơn vị gia hạn:</label>
+<div class="cycle-options" style="grid-template-columns:repeat(5,1fr)">
+<div class="cycle-option selected" data-cycle="minutely" onclick="selectRenewCycle(this)">
+<div class="cycle-name"><i class="fas fa-stopwatch"></i> Phút</div>
+<div class="cycle-price" id="renewPriceMinutely">--</div>
+</div>
+<div class="cycle-option" data-cycle="hourly" onclick="selectRenewCycle(this)">
+<div class="cycle-name"><i class="fas fa-hourglass-half"></i> Giờ</div>
 <div class="cycle-price" id="renewPriceHourly">--</div>
 </div>
 <div class="cycle-option" data-cycle="daily" onclick="selectRenewCycle(this)">
-<div class="cycle-name"><i class="fas fa-sun"></i> Theo ngày</div>
+<div class="cycle-name"><i class="fas fa-sun"></i> Ngày</div>
 <div class="cycle-price" id="renewPriceDaily">--</div>
 </div>
+<div class="cycle-option" data-cycle="weekly" onclick="selectRenewCycle(this)">
+<div class="cycle-name"><i class="fas fa-calendar-week"></i> Tuần</div>
+<div class="cycle-price" id="renewPriceWeekly">--</div>
+</div>
 <div class="cycle-option" data-cycle="monthly" onclick="selectRenewCycle(this)">
-<div class="cycle-name"><i class="fas fa-calendar-alt"></i> Theo tháng</div>
+<div class="cycle-name"><i class="fas fa-calendar-alt"></i> Tháng</div>
 <div class="cycle-price" id="renewPriceMonthly">--</div>
 </div>
 </div>
-<input type="hidden" name="billing_cycle" id="selectedRenewCycle" value="hourly">
+<div class="form-group" style="margin-top:12px;display:flex;align-items:center;gap:12px">
+<label style="margin:0;white-space:nowrap;font-weight:600">Số lượng gia hạn:</label>
+<input type="number" id="renewDurationInput" name="duration" value="1" min="1" style="width:100px;padding:10px;border:1px solid #cbd5e1;border-radius:8px;font-size:14px" oninput="updateRenewTotal()">
+<span style="color:#64748b;font-size:13px" id="renewDurationLabel">phút</span>
+</div>
+<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:12px;margin-top:10px;display:flex;justify-content:space-between;align-items:center">
+<span style="font-weight:600;color:#1e293b">Tổng tiền gia hạn:</span>
+<span id="renewTotalDisplay" style="font-size:18px;font-weight:800;color:#2563eb">0 VNĐ</span>
+</div>
+<input type="hidden" name="billing_cycle" id="selectedRenewCycle" value="minutely">
 </div>
 <button type="submit" class="btn-submit" id="renewSubmitBtn"><i class="fas fa-check-circle"></i> Xác nhận Gia hạn</button>
 </form>
@@ -1667,7 +1865,6 @@ body{font-family:'Inter',sans-serif;background:#f8fafc;color:#1e293b;min-height:
 </div>
 <script>
 const vmConfigs = {{ vm_configs|tojson }};
-const nodesInfo = {{ nodes_info|tojson }};
 function openRedeemModal(){ document.getElementById('redeemModal').classList.add('active'); }
 function closeRedeemModal(){ document.getElementById('redeemModal').classList.remove('active'); }
 window.addEventListener('DOMContentLoaded', () => {
@@ -1722,12 +1919,12 @@ function selectConfig(el){
     const val = el.dataset.config;
     document.getElementById('selectedConfig').value = val;
     updateCyclePrices(val);
-    updateNodeAvailability();
 }
 function selectCycle(el){
     document.querySelectorAll('.cycle-option').forEach(e=>e.classList.remove('selected'));
     el.classList.add('selected');
     document.getElementById('selectedCycle').value = el.dataset.cycle;
+    updateTotalPrice();
 }
 function selectOS(el){
     document.querySelectorAll('.os-option').forEach(e=>e.classList.remove('selected'));
@@ -1737,38 +1934,30 @@ function selectOS(el){
 function updateCyclePrices(configKey){
     const cfg = vmConfigs[configKey];
     if(!cfg) return;
-    document.getElementById('cyclePriceHourly').innerText = cfg.price_hourly.toLocaleString('vi-VN') + ' VNĐ';
-    document.getElementById('cyclePriceDaily').innerText = cfg.price_daily.toLocaleString('vi-VN') + ' VNĐ';
-    document.getElementById('cyclePriceMonthly').innerText = cfg.price_monthly.toLocaleString('vi-VN') + ' VNĐ';
-    document.querySelectorAll('.config-option .cfg-price').forEach(el=>{
-        const key = el.id.replace('price_','');
-        if(key === configKey){
-            const cycle = document.getElementById('selectedCycle').value;
-            const price = cycle === 'hourly' ? cfg.price_hourly : (cycle === 'daily' ? cfg.price_daily : cfg.price_monthly);
-            el.innerText = price.toLocaleString('vi-VN') + ' VNĐ/' + (cycle==='hourly'?'giờ':(cycle==='daily'?'ngày':'tháng'));
-        }
-    });
+    document.getElementById('cyclePriceMinutely').innerText = (cfg.price_minutely||0).toLocaleString('vi-VN') + ' VNĐ';
+    document.getElementById('cyclePriceHourly').innerText = (cfg.price_hourly||0).toLocaleString('vi-VN') + ' VNĐ';
+    document.getElementById('cyclePriceDaily').innerText = (cfg.price_daily||0).toLocaleString('vi-VN') + ' VNĐ';
+    document.getElementById('cyclePriceWeekly').innerText = (cfg.price_weekly||0).toLocaleString('vi-VN') + ' VNĐ';
+    document.getElementById('cyclePriceMonthly').innerText = (cfg.price_monthly||0).toLocaleString('vi-VN') + ' VNĐ';
+    updateTotalPrice();
 }
-function updateNodeAvailability(){
+
+function updateTotalPrice(){
     const configKey = document.getElementById('selectedConfig').value;
-    const select = document.getElementById('selectedNode');
-    if(!configKey || !vmConfigs[configKey] || !select) return;
+    const cycle = document.getElementById('selectedCycle').value;
+    const dur = parseInt(document.getElementById('durationInput').value) || 1;
     const cfg = vmConfigs[configKey];
-    Array.from(select.options).forEach(opt => {
-        const nid = opt.value;
-        if(!nid || !nodesInfo[nid]) return;
-        const info = nodesInfo[nid];
-        let disabled = false;
-        if(!info.enabled || info.full || info.overloaded || cfg.cpu > info.cpu || cfg.ram > info.ram || cfg.disk > info.disk){
-            disabled = true;
-        }
-        opt.disabled = disabled;
-        if(disabled){
-            opt.textContent = "🔒 " + info.name;
-            opt.style.color = '#c62828';
-        } else {
-            opt.textContent = info.name;
-            opt.style.color = '';
+    if(!cfg) { document.getElementById('totalPriceDisplay').innerText = '0 VNĐ'; return; }
+    const unitPrice = cfg['price_' + cycle] || 0;
+    const total = unitPrice * dur;
+    document.getElementById('totalPriceDisplay').innerText = total.toLocaleString('vi-VN') + ' VNĐ';
+    const labels = {minutely:'phút', hourly:'giờ', daily:'ngày', weekly:'tuần', monthly:'tháng'};
+    document.getElementById('durationLabel').innerText = labels[cycle] || '';
+    // Cập nhật giá hiển thị trên config card đang chọn
+    document.querySelectorAll('.config-option').forEach(el=>{
+        if(el.dataset.config === configKey){
+            const priceEl = el.querySelector('.cfg-price');
+            if(priceEl) priceEl.innerText = unitPrice.toLocaleString('vi-VN') + ' VNĐ/' + (labels[cycle]||'');
         }
     });
 }
@@ -1795,21 +1984,37 @@ function startVM(id){ showCenterNotice('Đang gửi lệnh bật máy ảo...', 
 function stopVM(id){ showCenterNotice('Đang gửi lệnh tắt máy ảo...', false, 1200); fetch('/api/vm/'+id+'/stop',{method:'POST'}).then(r=>r.json()).then(d=>{ if(d.success){ showCenterNotice('Đã phát lệnh tắt VM thành công.', false, 1500, () => location.reload()); } else showCenterNotice(d.error || 'Thất bại!', true); }); }
 function deleteVM(id){ if(!confirm('Bạn có chắc chắn muốn xóa máy ảo này? Thao tác không thể hoàn tác.')) return; fetch('/api/vm/'+id+'/delete',{method:'POST'}).then(r=>r.json()).then(d=>{ if(d.success){ showCenterNotice('Đã xóa máy ảo thành công.', false, 1500, () => location.reload()); } else showCenterNotice(d.error || 'Thất bại!', true); }); }
 function viewVM(id){ window.open('/vm/'+id+'/logs','_blank','width=900,height=700'); }
-function openRenewModal(vmId, pHourly, pDaily, pMonthly){
+let currentRenewPrices = {};
+function openRenewModal(vmId, pMinutely, pHourly, pDaily, pWeekly, pMonthly){
     document.getElementById('renewVmId').value = vmId;
-    document.getElementById('renewPriceHourly').innerText = Number(pHourly).toLocaleString('vi-VN') + ' VNĐ';
-    document.getElementById('renewPriceDaily').innerText = Number(pDaily).toLocaleString('vi-VN') + ' VNĐ';
-    document.getElementById('renewPriceMonthly').innerText = Number(pMonthly).toLocaleString('vi-VN') + ' VNĐ';
+    currentRenewPrices = {minutely:pMinutely||0, hourly:pHourly||0, daily:pDaily||0, weekly:pWeekly||0, monthly:pMonthly||0};
+    document.getElementById('renewPriceMinutely').innerText = Number(currentRenewPrices.minutely).toLocaleString('vi-VN') + ' VNĐ';
+    document.getElementById('renewPriceHourly').innerText = Number(currentRenewPrices.hourly).toLocaleString('vi-VN') + ' VNĐ';
+    document.getElementById('renewPriceDaily').innerText = Number(currentRenewPrices.daily).toLocaleString('vi-VN') + ' VNĐ';
+    document.getElementById('renewPriceWeekly').innerText = Number(currentRenewPrices.weekly).toLocaleString('vi-VN') + ' VNĐ';
+    document.getElementById('renewPriceMonthly').innerText = Number(currentRenewPrices.monthly).toLocaleString('vi-VN') + ' VNĐ';
     document.querySelectorAll('#renewModal .cycle-option').forEach(e=>e.classList.remove('selected'));
-    document.querySelector('#renewModal .cycle-option[data-cycle="hourly"]').classList.add('selected');
-    document.getElementById('selectedRenewCycle').value = 'hourly';
+    document.querySelector('#renewModal .cycle-option[data-cycle="minutely"]').classList.add('selected');
+    document.getElementById('selectedRenewCycle').value = 'minutely';
+    document.getElementById('renewDurationInput').value = 1;
+    updateRenewTotal();
     document.getElementById('renewModal').classList.add('active');
+}
+function updateRenewTotal(){
+    const cycle = document.getElementById('selectedRenewCycle').value;
+    const dur = parseInt(document.getElementById('renewDurationInput').value) || 1;
+    const unitPrice = currentRenewPrices[cycle] || 0;
+    const total = unitPrice * dur;
+    document.getElementById('renewTotalDisplay').innerText = total.toLocaleString('vi-VN') + ' VNĐ';
+    const labels = {minutely:'phút', hourly:'giờ', daily:'ngày', weekly:'tuần', monthly:'tháng'};
+    document.getElementById('renewDurationLabel').innerText = labels[cycle] || '';
 }
 function closeRenewModal(){ document.getElementById('renewModal').classList.remove('active'); }
 function selectRenewCycle(el){
     document.querySelectorAll('#renewModal .cycle-option').forEach(e=>e.classList.remove('selected'));
     el.classList.add('selected');
     document.getElementById('selectedRenewCycle').value = el.dataset.cycle;
+    updateRenewTotal();
 }
 function renewVM(e){
     e.preventDefault();
@@ -1839,6 +2044,144 @@ function adminDeleteVM(userId, vmId, vmName){
         else { alert(d.error || 'Thất bại!'); }
     }).catch(()=>alert('Không thể kết nối máy chủ!'));
 }
+</script>
+
+<!-- MODAL CẢNH BÁO HẾT HẠN -->
+<div class="modal-overlay" id="expiryAlertModal" style="z-index:4000;background:rgba(15,23,42,0.85)">
+<div class="modal" style="width:520px;text-align:center;border-top:5px solid #dc2626">
+<div class="modal-header" style="border-bottom:none;justify-content:center">
+<h3 style="color:#dc2626;font-size:20px"><i class="fas fa-exclamation-triangle"></i> CẢNH BÁO: Máy ảo sắp hết hạn</h3>
+</div>
+<div style="font-size:15px;color:#334155;margin-bottom:20px;line-height:1.6">
+Máy ảo <strong id="expiryVmName" style="color:#0f172a"></strong> sẽ hết hạn sau <strong id="expiryTimeLeft" style="color:#dc2626;font-size:18px"></strong>.<br>
+Vui lòng chọn hành động ngay bây giờ!
+</div>
+<div style="background:#fee2e2;border:1px solid #fecaca;color:#991b1b;padding:10px;border-radius:8px;margin-bottom:20px;font-weight:600;font-size:13px">
+<i class="fas fa-stopwatch"></i> Tự động dừng & xóa sau: <span id="expiryAutoDelete" style="font-size:18px;font-family:monospace">02:00</span> nếu không chọn
+</div>
+<div style="display:flex;gap:12px;justify-content:center">
+<button class="btn-submit" style="background:#dc2626;flex:1" onclick="expiryChooseNoRenew()"><i class="fas fa-trash"></i> Không gia hạn (Xóa VM)</button>
+<button class="btn-submit" style="background:#16a34a;flex:1" onclick="expiryChooseRenew()"><i class="fas fa-sync-alt"></i> Gia hạn ngay</button>
+</div>
+</div>
+</div>
+
+<script>
+(function(){
+  const WARNING_SECONDS = 600; // 10 phút cảnh báo
+  const AUTO_DELETE_SECONDS = 120; // 2 phút tự động xóa
+  let expiryModalActive = false;
+  let expiryAutoDeleteTimer = null;
+  let currentExpiryVmId = null;
+  let currentExpiryVmName = "";
+
+  function formatCountdown(ms){
+    if(ms <= 0) return "00:00:00";
+    const totalSec = Math.floor(ms/1000);
+    const h = Math.floor(totalSec/3600);
+    const m = Math.floor((totalSec%3600)/60);
+    const s = totalSec%60;
+    return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  }
+
+  function updateCountdowns(){
+    const now = new Date().getTime();
+    document.querySelectorAll('.vm-card[data-expiry]').forEach(card=>{
+      const expiry = card.dataset.expiry;
+      const vmId = card.dataset.vmId;
+      const vmName = card.dataset.name;
+      const row = card.querySelector('.countdown-row');
+      const txt = card.querySelector('.countdown-text');
+      if(!expiry || expiry === ""){ if(row) row.style.display='none'; return; }
+      const end = new Date(expiry).getTime();
+      const diff = end - now;
+      if(row) row.style.display = 'flex';
+      if(txt) txt.textContent = formatCountdown(diff);
+      if(diff <= 0 && txt){ txt.style.color = '#dc2626'; txt.textContent = "ĐÃ HẾT HẠN"; }
+      else if(diff <= WARNING_SECONDS*1000 && txt){ txt.style.color = '#dc2626'; }
+      else if(txt){ txt.style.color = '#0369a1'; }
+
+      // Cảnh báo modal khi trong khoảng 0 -> 10 phút
+      if(diff <= WARNING_SECONDS*1000 && diff > 0 && !expiryModalActive){
+        openExpiryAlert(vmId, vmName, diff);
+      }
+    });
+  }
+
+  function openExpiryAlert(vmId, vmName, diffMs){
+    expiryModalActive = true;
+    currentExpiryVmId = vmId;
+    currentExpiryVmName = vmName;
+    document.getElementById('expiryVmName').textContent = vmName;
+    document.getElementById('expiryTimeLeft').textContent = formatCountdown(diffMs);
+    document.getElementById('expiryAlertModal').classList.add('active');
+    startAutoDeleteCountdown();
+  }
+
+  function startAutoDeleteCountdown(){
+    let left = AUTO_DELETE_SECONDS;
+    const el = document.getElementById('expiryAutoDelete');
+    if(expiryAutoDeleteTimer) clearInterval(expiryAutoDeleteTimer);
+    expiryAutoDeleteTimer = setInterval(()=>{
+      left--;
+      const m = Math.floor(left/60);
+      const s = left%60;
+      el.textContent = `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+      if(left <= 0){
+        clearInterval(expiryAutoDeleteTimer);
+        expiryAutoDeleteTimer = null;
+        document.getElementById('expiryAlertModal').classList.remove('active');
+        expiryModalActive = false;
+        // Tự động dừng rồi xóa
+        if(currentExpiryVmId){
+          fetch('/api/vm/'+currentExpiryVmId+'/stop',{method:'POST'})
+          .then(()=>{
+             setTimeout(()=>{
+               fetch('/api/vm/'+currentExpiryVmId+'/delete',{method:'POST'})
+               .then(()=>{ showCenterNotice('VM đã tự động dừng và xóa do hết hạn.',false,2000,()=>location.reload()); })
+               .catch(()=>showCenterNotice('Lỗi tự động xóa VM!',true));
+             }, 2000);
+          })
+          .catch(()=>showCenterNotice('Lỗi tự động dừng VM!',true));
+        }
+      }
+    }, 1000);
+  }
+
+  window.expiryChooseRenew = function(){
+    if(expiryAutoDeleteTimer){ clearInterval(expiryAutoDeleteTimer); expiryAutoDeleteTimer=null; }
+    document.getElementById('expiryAlertModal').classList.remove('active');
+    expiryModalActive = false;
+    // Mở renewModal với vmId hiện tại
+    const vm = document.querySelector('.vm-card[data-vm-id="'+currentExpiryVmId+'"]');
+    if(vm){
+      const cfgKey = vm.querySelector('.config-option')?.dataset?.config; // không có sẵn
+      // Lấy giá từ card text
+      openRenewModal(currentExpiryVmId, 0,0,0); // giá sẽ lấy từ server khi gọi? Không, ta truyền 0 và để renewModal tự fill từ vm data? Hiện tại openRenewModal cần giá. 
+      // Thay vào đó, gọi API lấy giá hoặc dùng giá mặc định. Đơn giản: reload trang để lấy giá chuẩn.
+      // Nhưng tốt hơn: ta sẽ gọi API lấy vm info
+      fetch('/api/vm/'+currentExpiryVmId+'/info').then(r=>r.json()).then(d=>{
+        if(d.success && d.config){
+          openRenewModal(currentExpiryVmId, d.config.price_minutely||0, d.config.price_hourly||0, d.config.price_daily||0, d.config.price_weekly||0, d.config.price_monthly||0);
+        } else {
+          showCenterNotice('Không lấy được thông tin giá, vui lòng gia hạn thủ công.',true);
+        }
+      }).catch(()=>showCenterNotice('Lỗi kết nối khi lấy giá gia hạn.',true));
+    }
+  };
+
+  window.expiryChooseNoRenew = function(){
+    if(expiryAutoDeleteTimer){ clearInterval(expiryAutoDeleteTimer); expiryAutoDeleteTimer=null; }
+    document.getElementById('expiryAlertModal').classList.remove('active');
+    expiryModalActive = false;
+    if(currentExpiryVmId){
+      deleteVM(currentExpiryVmId);
+    }
+  };
+
+  setInterval(updateCountdowns, 1000);
+  updateCountdowns();
+})();
 </script>
 </body>
 </html>"""
@@ -1929,10 +2272,25 @@ body{font-family:'Inter',sans-serif;background:#f5f7fa;color:#333;min-height:100
 {% else %}
 <div class="vm-info-row"><span>Cấu hình:</span><strong>{{ sk.vps_cpu }}C / {{ sk.vps_ram }}G / {{ sk.vps_disk }}G</strong></div>
 {% endif %}
-<div class="vm-info-row"><span>Trạng thái:</span><strong style="color:#2e7d32">Còn hàng ({{ sk._shop_stock|default(1) }} Key)</strong></div>
+<div class="vm-info-row"><span>Trạng thái:</span>
+{% if sk._is_sold_out %}
+<strong style="color:#c62828">Đã hết hàng</strong>
+{% else %}
+<strong style="color:#2e7d32">Còn hàng ({{ sk._shop_stock|default(1) }} Key)</strong>
+{% endif %}
+</div>
+{% if sk._is_sold_out and sk.sold_out_at %}
+<div class="vm-info-row"><span>Gỡ Shop sau:</span>
+<strong class="shop-countdown" style="color:#d97706;font-family:monospace" data-start="{{ sk.sold_out_at }}" data-duration="{{ sk.shop_grace_minutes|default(2) }}">--</strong>
+</div>
+{% endif %}
 </div>
 </div>
+{% if sk._is_sold_out %}
+<button class="btn-buy soldout" disabled><i class="fas fa-ban"></i> Đã hết hàng</button>
+{% else %}
 <button class="btn-buy" style="background:#FF9800" onclick="openBuyKeyModal('{{ sk.code }}', '{{ sk.vps_name if sk.type == 'vps' else "Key " + sk.amount|string + " VNĐ" }}', '{{ sk.shop_price|vnd }}')"><i class="fas fa-shopping-cart"></i> Mua Key Ngay</button>
+{% endif %}
 </div>
 {% endfor %}
 {% else %}
@@ -2009,7 +2367,7 @@ body{font-family:'Inter',sans-serif;background:#f5f7fa;color:#333;min-height:100
 </div>
 </div>
 <div class="modal-overlay" id="renewModal">
-<div class="modal" style="width:480px">
+<div class="modal" style="width:520px">
 <div class="modal-header">
 <h3><i class="fas fa-sync-alt" style="color:{{ settings.primary_color }}"></i> Gia hạn Máy ảo</h3>
 <div class="modal-close" onclick="closeRenewModal()">&times;</div>
@@ -2017,22 +2375,39 @@ body{font-family:'Inter',sans-serif;background:#f5f7fa;color:#333;min-height:100
 <form id="renewForm" onsubmit="return renewVM(event)">
 <input type="hidden" name="vm_id" id="renewVmId">
 <div class="form-group">
-<label><i class="fas fa-clock" style="color:{{ settings.primary_color }};margin-right:6px"></i> Chọn chu kỳ gia hạn:</label>
-<div class="cycle-options">
-<div class="cycle-option selected" data-cycle="hourly" onclick="selectRenewCycle(this)">
-<div class="cycle-name"><i class="fas fa-hourglass-half"></i> Theo giờ</div>
+<label><i class="fas fa-clock" style="color:{{ settings.primary_color }};margin-right:6px"></i> Chọn đơn vị gia hạn:</label>
+<div class="cycle-options" style="grid-template-columns:repeat(5,1fr)">
+<div class="cycle-option selected" data-cycle="minutely" onclick="selectRenewCycle(this)">
+<div class="cycle-name"><i class="fas fa-stopwatch"></i> Phút</div>
+<div class="cycle-price" id="renewPriceMinutely">--</div>
+</div>
+<div class="cycle-option" data-cycle="hourly" onclick="selectRenewCycle(this)">
+<div class="cycle-name"><i class="fas fa-hourglass-half"></i> Giờ</div>
 <div class="cycle-price" id="renewPriceHourly">--</div>
 </div>
 <div class="cycle-option" data-cycle="daily" onclick="selectRenewCycle(this)">
-<div class="cycle-name"><i class="fas fa-sun"></i> Theo ngày</div>
+<div class="cycle-name"><i class="fas fa-sun"></i> Ngày</div>
 <div class="cycle-price" id="renewPriceDaily">--</div>
 </div>
+<div class="cycle-option" data-cycle="weekly" onclick="selectRenewCycle(this)">
+<div class="cycle-name"><i class="fas fa-calendar-week"></i> Tuần</div>
+<div class="cycle-price" id="renewPriceWeekly">--</div>
+</div>
 <div class="cycle-option" data-cycle="monthly" onclick="selectRenewCycle(this)">
-<div class="cycle-name"><i class="fas fa-calendar-alt"></i> Theo tháng</div>
+<div class="cycle-name"><i class="fas fa-calendar-alt"></i> Tháng</div>
 <div class="cycle-price" id="renewPriceMonthly">--</div>
 </div>
 </div>
-<input type="hidden" name="billing_cycle" id="selectedRenewCycle" value="hourly">
+<div class="form-group" style="margin-top:12px;display:flex;align-items:center;gap:12px">
+<label style="margin:0;white-space:nowrap;font-weight:600">Số lượng gia hạn:</label>
+<input type="number" id="renewDurationInput" name="duration" value="1" min="1" style="width:100px;padding:10px;border:1px solid #cbd5e1;border-radius:8px;font-size:14px" oninput="updateRenewTotal()">
+<span style="color:#64748b;font-size:13px" id="renewDurationLabel">phút</span>
+</div>
+<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:12px;margin-top:10px;display:flex;justify-content:space-between;align-items:center">
+<span style="font-weight:600;color:#1e293b">Tổng tiền gia hạn:</span>
+<span id="renewTotalDisplay" style="font-size:18px;font-weight:800;color:#2563eb">0 VNĐ</span>
+</div>
+<input type="hidden" name="billing_cycle" id="selectedRenewCycle" value="minutely">
 </div>
 <button type="submit" class="btn-submit" id="renewSubmitBtn"><i class="fas fa-check-circle"></i> Xác nhận Gia hạn</button>
 </form>
@@ -2124,6 +2499,29 @@ function copyPurchasedKey(){
 function redeemPurchasedKey(){
     window.location.href = '/dashboard?code=' + encodeURIComponent(lastPurchasedCode);
 }
+
+// Shop countdown updater
+(function(){
+  function updateShopCountdowns(){
+    const now = Math.floor(Date.now()/1000);
+    document.querySelectorAll('.shop-countdown').forEach(el=>{
+      const start = parseFloat(el.dataset.start);
+      const duration = parseInt(el.dataset.duration) || 2;
+      const elapsed = now - start;
+      const left = duration*60 - elapsed;
+      if(left <= 0){
+        el.textContent = "Đang gỡ...";
+        el.style.color = "#999";
+      } else {
+        const m = Math.floor(left/60);
+        const s = Math.floor(left%60);
+        el.textContent = `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+      }
+    });
+  }
+  setInterval(updateShopCountdowns, 1000);
+  updateShopCountdowns();
+})();
 </script>
 <script>
 function adminDeleteVM(userId, vmId, vmName){
@@ -2365,7 +2763,7 @@ h1{font-size:22px;color:#1a237e}
 <div class="vm-grid">
 {% if vms %}
 {% for vm in vms %}
-<div class="vm-card">
+<div class="vm-card" data-vm-id="{{ vm.id }}" data-expiry="{{ vm.expiry_time }}" data-name="{{ vm.name }}">
 <div>
 <div class="vm-header">
 <h4><i class="fab fa-windows" style="color:{{ settings.primary_color }};font-size:18px"></i> {{ vm.name }}</h4>
@@ -2373,6 +2771,7 @@ h1{font-size:22px;color:#1a237e}
 </div>
 <div class="vm-info">
 <div class="vm-info-row"><span>VM ID:</span><strong style="color:#0f172a;font-family:monospace">{{ vm.id }}</strong></div>
+<div class="vm-info-row"><span>Hết hạn:</span><strong style="color:{% if vm.is_expired %}#dc2626{% else %}#d97706{% endif %}">{{ vm.expiry_text }}</strong></div>
 <div class="vm-info-row"><span>Cấu hình:</span><strong style="color:#0f172a">{{ vm.cpu }} vCPU / {{ vm.ram }} GB RAM / {{ vm.disk }} GB SSD</strong></div>
 <div class="vm-info-row"><span>Hệ điều hành:</span><strong style="color:#0f172a">{{ vm.os }}</strong></div>
 <div class="vm-info-row"><span>Server:</span><strong style="color:#0f172a">{{ vm.node_name }}</strong></div>
@@ -2521,6 +2920,10 @@ h1{font-size:22px;color:#1a237e}
 <label>Ngày tạo</label>
 <div class="value">{{ vm.created_at[:16] if vm.created_at else 'N/A' }}</div>
 </div>
+<div class="info-card">
+<label>Thời gian còn lại</label>
+<div class="value" id="adminVmDetailCountdown" data-expiry="{{ vm.expiry_time }}" style="font-family:monospace;color:#0369a1">--</div>
+</div>
 </div>
 <div class="actions-bar">
 <a href="/admin/vm/{{ target_user.id }}/{{ vm_id }}/logs" target="_blank" class="btn-log"><i class="fas fa-terminal"></i> Mở Logs trong tab mới</a>
@@ -2656,8 +3059,8 @@ input:checked + .slider:before{transform:translateX(20px)}
 <tr>
 <th>ID</th>
 <th>Tên Server</th>
-<th>Tài nguyên (CPU/RAM/Disk)</th>
-<th>VM</th>
+<th>Tunnel URL / Kết nối</th>
+<th>Loại</th>
 <th>Trạng thái</th>
 <th>Hành động</th>
 </tr>
@@ -2667,38 +3070,25 @@ input:checked + .slider:before{transform:translateX(20px)}
 <tr>
 <td><code>{{ node_id }}</code></td>
 <td><strong>{{ node.name }}</strong></td>
-<td style="font-size:12px">
-{% if node._status.get('success', False) %}
-    {% if node._status.get('note') %}
-        <span style="color:#c62828;font-weight:600"><i class="fas fa-exclamation-circle"></i> {{ node._status.note }}</span>
-    {% else %}
-        <div><i class="fas fa-microchip" style="color:#2196F3"></i> {{ node._status.get('cpu_count', 0) or '?' }} Core ({{ node._status.get('cpu_percent', 0) }}%)</div>
-        <div><i class="fas fa-memory" style="color:#673AB7"></i> {{ node._status.get('ram_total_gb', 0) or '?' }} GB ({{ node._status.get('ram_percent', 0) }}%)</div>
-        <div><i class="fas fa-hdd" style="color:#607D8B"></i> {{ node._status.get('disk_total_gb', 0) or '?' }} GB ({{ node._status.get('disk_percent', 0) }}%)</div>
-    {% endif %}
-{% else %}
-<span style="color:#999"><i class="fas fa-times-circle"></i> Không có dữ liệu / Offline</span>
-{% endif %}
-</td>
-<td style="font-size:12px">
-<div><strong>{{ node._vm_count }}</strong> / {% if node._max_vms > 0 %}{{ node._max_vms }}{% else %}∞{% endif %} VM</div>
-{% if node._full %}
-<span style="color:#c62828;font-weight:600"><i class="fas fa-lock"></i> Đã đầy (Admin giới hạn)</span>
-{% elif node._overloaded %}
-<span style="color:#c62828;font-weight:600"><i class="fas fa-exclamation-triangle"></i> Quá tải tài nguyên</span>
-{% else %}
-<span style="color:#2e7d32"><i class="fas fa-check"></i> Sẵn sàng</span>
-{% endif %}
-</td>
 <td>
-{% if node._status.get('success', False) %}
+{% if node.tunnel_url %}
+<a href="{{ node.tunnel_url }}" target="_blank" style="color:#2196F3;font-size:12px;word-break:break-all">{{ node.tunnel_url }}</a>
+{% elif node.type == 'local' %}
+<span style="color:#666;font-size:12px">127.0.0.1:5000</span>
+{% else %}
+<span style="color:#999;font-size:12px"><i class="fas fa-hourglass-half"></i> Chờ Worker kết nối...</span>
+{% endif %}
+</td>
+<td>{% if node.type == 'local' %}<span class="badge-user">Local</span>{% else %}<span class="badge-admin">Worker</span>{% endif %}</td>
+<td>
+{% if node._status.success %}
 <span style="color:#2e7d32;font-weight:600"><i class="fas fa-check-circle"></i> Online</span>
+<small style="color:#666;display:block">CPU: {{ node._status.cpu_percent }}% | RAM: {{ node._status.ram_percent }}%</small>
 {% else %}
 <span style="color:#c62828;font-weight:600"><i class="fas fa-times-circle"></i> Offline</span>
 {% endif %}
 </td>
 <td>
-<button class="btn-action btn-edit" onclick="openEditNodeModal('{{ node_id }}', '{{ node.name|replace("'", "\'") }}', {{ node.max_vms|default(0) }}, {{ 'true' if node.enabled else 'false' }})" title="Cài đặt Node"><i class="fas fa-cog"></i></button>
 {% if node_id != 'local' %}
 <button class="btn-action btn-edit" onclick="testNode('{{ node_id }}')"><i class="fas fa-plug"></i> Test</button>
 <button class="btn-action btn-del" onclick="deleteNode('{{ node_id }}')"><i class="fas fa-trash"></i> Xóa</button>
@@ -2723,37 +3113,15 @@ input:checked + .slider:before{transform:translateX(20px)}
 <div class="form-group" style="margin-bottom:12px"><label>ID Node (vd: node1)</label><input id="nodeId" name="node_id" pattern="[A-Za-z0-9_-]+" required placeholder="node1"></div>
 <div class="form-group" style="margin-bottom:12px"><label>Tên hiển thị</label><input id="nodeName" name="name" required placeholder="Server 1 - VPS HCM"></div>
 <div class="form-group" style="margin-bottom:12px"><label>Worker Token (lấy từ máy Worker)</label><input id="nodeToken" name="token" placeholder="abc123..." required></div>
-<div class="form-group" style="margin-bottom:12px"><label>Giới hạn số VM (0 = không giới hạn)</label><input id="nodeMaxVms" name="max_vms" type="number" min="0" value="0" placeholder="0"></div>
 <div class="form-group" style="margin-bottom:15px">
 <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
 <input type="checkbox" id="nodeEnabled" name="enabled" checked style="width:18px;height:18px"> Kích hoạt node
 </label>
 </div>
 <div style="background:#fff3e0;border:1px solid #ffcc80;padding:10px;border-radius:6px;font-size:12px;color:#e65100;margin-bottom:12px">
-<i class="fas fa-info-circle"></i> <strong>Không cần nhập IP!</strong> Worker sẽ tự động chạy tunnel và gửi URL về Master khi khởi động. Nếu giới hạn VM = 0 thì không giới hạn số lượng.
+<i class="fas fa-info-circle"></i> <strong>Không cần nhập IP!</strong> Worker sẽ tự động chạy tunnel và gửi URL về Master khi khởi động.
 </div>
 <button type="submit" class="btn-action btn-add" style="width:100%;padding:11px;justify-content:center;font-size:14px;margin-top:5px"><i class="fas fa-save"></i> Lưu Node</button>
-</form>
-</div>
-</div>
-
-<!-- MODAL CHỈNH SỬA NODE (Settings) -->
-<div class="modal-overlay" id="editNodeModal">
-<div class="modal">
-<div class="modal-header">
-<h3 id="editNodeModalTitle" style="font-size:18px"><i class="fas fa-cog" style="color:#2196F3"></i> Cài đặt Node</h3>
-<button type="button" onclick="closeEditNodeModal()" style="background:none;border:none;font-size:20px;cursor:pointer">&times;</button>
-</div>
-<form id="editNodeForm" onsubmit="saveEditNode(event)">
-<input type="hidden" id="editNodeId" name="node_id">
-<div class="form-group" style="margin-bottom:12px"><label>Tên hiển thị</label><input id="editNodeName" name="name" required placeholder="Server 1 - VPS HCM"></div>
-<div class="form-group" style="margin-bottom:12px"><label>Giới hạn số VM (0 = không giới hạn)</label><input id="editNodeMaxVms" name="max_vms" type="number" min="0" value="0" placeholder="0"></div>
-<div class="form-group" style="margin-bottom:15px">
-<label style="display:flex;align-items:center;gap:8px;cursor:pointer">
-<input type="checkbox" id="editNodeEnabled" name="enabled" style="width:18px;height:18px"> Kích hoạt node
-</label>
-</div>
-<button type="submit" class="btn-action btn-add" style="width:100%;padding:11px;justify-content:center;font-size:14px;margin-top:5px"><i class="fas fa-save"></i> Lưu thay đổi</button>
 </form>
 </div>
 </div>
@@ -2772,6 +3140,11 @@ input:checked + .slider:before{transform:translateX(20px)}
 <div class="form-group">
 <label>Màu chủ đạo (hex)</label>
 <input type="text" name="primary_color" value="{{ settings.primary_color }}" placeholder="#2196F3" required>
+</div>
+<div class="form-group">
+<label>Thời gian gỡ đơn hàng Shop (phút)</label>
+<input type="number" name="marketplace_cleanup_minutes" value="{{ settings.marketplace_cleanup_minutes|default(2) }}" min="1" required>
+<small style="color:#64748b;font-size:12px">Sau số phút này, đơn hết hàng sẽ tự động biến mất khỏi Chợ VPS.</small>
 </div>
 <div class="form-group">
 <label>Khóa logs VM mặc định</label>
@@ -2845,10 +3218,12 @@ input:checked + .slider:before{transform:translateX(20px)}
 <div><b>SSD</b><br>{{ cfg.disk }} GB</div>
 <div><b>Mã gói</b><br><code>{{ cfg_key }}</code></div>
 </div>
-<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px;font-size:12px">
-<div style="background:#e8f5e9;padding:8px;border-radius:6px;text-align:center"><div style="color:#2e7d32;font-weight:700">{{ cfg.price_hourly|vnd }}</div><div style="color:#555">/giờ</div></div>
-<div style="background:#fff3e0;padding:8px;border-radius:6px;text-align:center"><div style="color:#e65100;font-weight:700">{{ cfg.price_daily|vnd }}</div><div style="color:#555">/ngày</div></div>
-<div style="background:#e3f2fd;padding:8px;border-radius:6px;text-align:center"><div style="color:#1565c0;font-weight:700">{{ cfg.price_monthly|vnd }}</div><div style="color:#555">/tháng</div></div>
+<div style="display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-top:10px;font-size:11px">
+<div style="background:#f3e8ff;padding:6px;border-radius:6px;text-align:center"><div style="color:#7c3aed;font-weight:700">{{ cfg.price_minutely|vnd }}</div><div style="color:#555">/phút</div></div>
+<div style="background:#e8f5e9;padding:6px;border-radius:6px;text-align:center"><div style="color:#2e7d32;font-weight:700">{{ cfg.price_hourly|vnd }}</div><div style="color:#555">/giờ</div></div>
+<div style="background:#fff3e0;padding:6px;border-radius:6px;text-align:center"><div style="color:#e65100;font-weight:700">{{ cfg.price_daily|vnd }}</div><div style="color:#555">/ngày</div></div>
+<div style="background:#fce7f3;padding:6px;border-radius:6px;text-align:center"><div style="color:#db2777;font-weight:700">{{ cfg.price_weekly|vnd }}</div><div style="color:#555">/tuần</div></div>
+<div style="background:#e3f2fd;padding:6px;border-radius:6px;text-align:center"><div style="color:#1565c0;font-weight:700">{{ cfg.price_monthly|vnd }}</div><div style="color:#555">/tháng</div></div>
 </div>
 </div>
 {% endfor %}
@@ -2872,11 +3247,15 @@ input:checked + .slider:before{transform:translateX(20px)}
 <div class="form-group"><label>SSD (GB)</label><input id="configDisk" type="number" name="disk" min="1" required></div>
 </div>
 <div class="form-row">
-<div class="form-group"><label>Giá theo giờ (VNĐ)</label><input id="configPriceHourly" type="number" name="price_hourly" min="0" step="1" required></div>
-<div class="form-group"><label>Giá theo ngày (VNĐ)</label><input id="configPriceDaily" type="number" name="price_daily" min="0" step="1" required></div>
-<div class="form-group"><label>Giá theo tháng (VNĐ)</label><input id="configPriceMonthly" type="number" name="price_monthly" min="0" step="1" required></div>
+<div class="form-group"><label>Giá / phút (VNĐ)</label><input id="configPriceMinutely" type="number" name="price_minutely" min="0" step="1" required></div>
+<div class="form-group"><label>Giá / giờ (VNĐ)</label><input id="configPriceHourly" type="number" name="price_hourly" min="0" step="1" required></div>
+<div class="form-group"><label>Giá / ngày (VNĐ)</label><input id="configPriceDaily" type="number" name="price_daily" min="0" step="1" required></div>
 </div>
-<div class="small-note">Nhập đúng giá cho từng chu kỳ thuê: giờ / ngày / tháng.</div>
+<div class="form-row">
+<div class="form-group"><label>Giá / tuần (VNĐ)</label><input id="configPriceWeekly" type="number" name="price_weekly" min="0" step="1" required></div>
+<div class="form-group"><label>Giá / tháng (VNĐ)</label><input id="configPriceMonthly" type="number" name="price_monthly" min="0" step="1" required></div>
+</div>
+<div class="small-note">Nhập đúng giá cho 5 đơn vị thuê: phút / giờ / ngày / tuần / tháng.</div>
 <button type="submit" class="btn-action btn-add" style="width:100%;padding:11px;justify-content:center;font-size:14px;margin-top:15px"><i class="fas fa-save"></i> Lưu cấu hình</button>
 </form>
 </div>
@@ -2940,9 +3319,29 @@ input:checked + .slider:before{transform:translateX(20px)}
 <label>Số lượng Key đưa lên Shop</label>
 <input type="number" name="quantity" min="1" value="1" placeholder="Ví dụ: 10">
 </div>
+<div class="form-group" id="shop_grace_group" style="display:none;">
+<label>Thờigian gỡ Shop khi hết hàng (phút)</label>
+<input type="number" name="shop_grace_minutes" min="1" value="2" placeholder="Ví dụ: 2">
+<small style="color:#64748b;font-size:12px">Key bán hết trên Chợ → chờ số phút này rồi gỡ xuống (Key vẫn còn để nhập).</small>
+</div>
+<div class="form-group">
+<label>Thờigian sống Key sau khi nhập (phút)</label>
+<input type="number" name="key_lifetime_minutes" min="1" value="60" placeholder="Ví dụ: 60">
+<small style="color:#64748b;font-size:12px">Từ lần đầu user nhập Key, sau số phút này Key sẽ tự động bị XÓA hoàn toàn.</small>
+</div>
+<div class="form-group">
+<label>Thờigian hiệu lực Key (ngày)</label>
+<input type="number" name="key_validity_days" min="1" value="30" placeholder="Ví dụ: 30">
+<small style="color:#64748b;font-size:12px">Key chỉ có thể nhập trong vòng X ngày kể từ khi tạo. Quá hạn = không nhập được.</small>
+</div>
 <div class="form-group">
 <label>Số lần 1 User được nhập Key này</label>
 <input type="number" name="max_uses_per_user" min="1" value="1" placeholder="Ví dụ: 3">
+</div>
+<div class="form-group">
+<label>Tổng số lượt nhập tối đa (tất cả User)</label>
+<input type="number" name="max_total_uses" min="1" value="1" placeholder="Ví dụ: 3">
+<small style="color:#64748b;font-size:12px">Tổng số lần Key này có thể được nhập. Ví dụ: 3 = cho phép 3 ngườinhập (dùng chung 1 code).</small>
 </div>
 </div>
 <button type="submit" class="btn-action btn-add" style="padding:10px 25px;font-size:14px;margin-top:10px;"><i class="fas fa-plus"></i> Tạo Key Mới</button>
@@ -2960,7 +3359,11 @@ input:checked + .slider:before{transform:translateX(20px)}
 <th>Loại</th>
 <th>Giá trị / Cấu hình</th>
 <th>Trạng thái Shop</th>
+<th>Gỡ Shop (phút)</th>
+<th>Sống Key (phút)</th>
+<th>Hiệu lực (ngày)</th>
 <th>Số lần / User</th>
+<th>Tổng lượt tối đa</th>
 <th>Trạng thái sử dụng</th>
 <th>Hành động</th>
 </tr>
@@ -2986,7 +3389,26 @@ input:checked + .slider:before{transform:translateX(20px)}
 {% endif %}
 </td>
 <td>
+<span style="font-weight:600;color:#d97706">{{ k.shop_grace_minutes|default(2) }} phút</span>
+{% if k.on_shop and k.used and k.sold_out_at %}
+<div class="key-countdown" data-start="{{ k.sold_out_at }}" data-duration="{{ k.shop_grace_minutes|default(2) }}" data-mode="soldout" style="font-family:monospace;font-size:12px;color:#dc2626;margin-top:2px">--</div>
+{% endif %}
+</td>
+<td>
+<span style="font-weight:600;color:#0369a1">{{ k.key_lifetime_minutes|default(60) }} phút</span>
+{% if k.redeemed_at %}
+<div class="key-countdown" data-start="{{ k.redeemed_at }}" data-duration="{{ k.key_lifetime_minutes|default(60) }}" data-mode="redeemed" style="font-family:monospace;font-size:12px;color:#dc2626;margin-top:2px">--</div>
+{% endif %}
+</td>
+<td>
+<span style="font-weight:600;color:#7c3aed">{{ k.key_validity_days|default(30) }} ngày</span>
+</td>
+<td>
 <strong style="color:#7c3aed">{{ k.max_uses_per_user|default(1) }} lần</strong>
+</td>
+<td>
+<strong style="color:#d97706">{{ k.max_total_uses|default(1) }} lượt</strong><br>
+<small style="color:#666">Đã dùng: {{ k.uses_by_user.values()|sum if k.uses_by_user else 0 }}</small>
 </td>
 <td>
 {% if k.used %}
@@ -3001,7 +3423,7 @@ input:checked + .slider:before{transform:translateX(20px)}
 </tr>
 {% endfor %}
 {% else %}
-<tr><td colspan="7" style="text-align:center;color:#777">Chưa có Key nào trong hệ thống.</td></tr>
+<tr><td colspan="11" style="text-align:center;color:#777">Chưa có Key nào trong hệ thống.</td></tr>
 {% endif %}
 </tbody>
 </table>
@@ -3062,6 +3484,7 @@ input:checked + .slider:before{transform:translateX(20px)}
 <th>User</th>
 <th>Tên VM</th>
 <th>VM ID</th>
+<th>Thời gian còn lại</th>
 <th>Trạng thái Logs</th>
 <th colspan="4">Hành động Quản lý</th>
 </tr>
@@ -3072,11 +3495,25 @@ input:checked + .slider:before{transform:translateX(20px)}
 <td><strong>{{ vm_info.username }}</strong></td>
 <td>{{ vm_info.vm_name }}</td>
 <td><code>{{ vm_info.vm_id }}</code></td>
+<td data-expiry="{{ vm_info.expiry_time }}">
+{% if vm_info.expiry_time %}
+<span class="admin-countdown" style="font-family:monospace;font-weight:600;color:#0369a1">--</span>
+{% else %}
+<span style="color:#999;font-size:12px">Không giới hạn</span>
+{% endif %}
+</td>
 <td>
 {% if vm_info.logs_locked %}
 <span style="color:#c62828;font-weight:600"><i class="fas fa-lock"></i> Đang khóa</span>
 {% else %}
 <span style="color:#2e7d32;font-weight:600"><i class="fas fa-lock-open"></i> Đang mở</span>
+{% endif %}
+</td>
+<td data-expiry="{{ vm_info.expiry_time }}">
+{% if vm_info.expiry_time %}
+<span class="admin-countdown" style="font-family:monospace;font-weight:600;color:#0369a1">--</span>
+{% else %}
+<span style="color:#999;font-size:12px">Không giới hạn</span>
 {% endif %}
 </td>
 <td>
@@ -3140,7 +3577,7 @@ input:checked + .slider:before{transform:translateX(20px)}
 </div>
 
 <div class="modal-overlay" id="renewModal">
-<div class="modal" style="width:480px">
+<div class="modal" style="width:520px">
 <div class="modal-header">
 <h3><i class="fas fa-sync-alt" style="color:{{ settings.primary_color }}"></i> Gia hạn Máy ảo</h3>
 <div class="modal-close" onclick="closeRenewModal()">&times;</div>
@@ -3148,22 +3585,39 @@ input:checked + .slider:before{transform:translateX(20px)}
 <form id="renewForm" onsubmit="return renewVM(event)">
 <input type="hidden" name="vm_id" id="renewVmId">
 <div class="form-group">
-<label><i class="fas fa-clock" style="color:{{ settings.primary_color }};margin-right:6px"></i> Chọn chu kỳ gia hạn:</label>
-<div class="cycle-options">
-<div class="cycle-option selected" data-cycle="hourly" onclick="selectRenewCycle(this)">
-<div class="cycle-name"><i class="fas fa-hourglass-half"></i> Theo giờ</div>
+<label><i class="fas fa-clock" style="color:{{ settings.primary_color }};margin-right:6px"></i> Chọn đơn vị gia hạn:</label>
+<div class="cycle-options" style="grid-template-columns:repeat(5,1fr)">
+<div class="cycle-option selected" data-cycle="minutely" onclick="selectRenewCycle(this)">
+<div class="cycle-name"><i class="fas fa-stopwatch"></i> Phút</div>
+<div class="cycle-price" id="renewPriceMinutely">--</div>
+</div>
+<div class="cycle-option" data-cycle="hourly" onclick="selectRenewCycle(this)">
+<div class="cycle-name"><i class="fas fa-hourglass-half"></i> Giờ</div>
 <div class="cycle-price" id="renewPriceHourly">--</div>
 </div>
 <div class="cycle-option" data-cycle="daily" onclick="selectRenewCycle(this)">
-<div class="cycle-name"><i class="fas fa-sun"></i> Theo ngày</div>
+<div class="cycle-name"><i class="fas fa-sun"></i> Ngày</div>
 <div class="cycle-price" id="renewPriceDaily">--</div>
 </div>
+<div class="cycle-option" data-cycle="weekly" onclick="selectRenewCycle(this)">
+<div class="cycle-name"><i class="fas fa-calendar-week"></i> Tuần</div>
+<div class="cycle-price" id="renewPriceWeekly">--</div>
+</div>
 <div class="cycle-option" data-cycle="monthly" onclick="selectRenewCycle(this)">
-<div class="cycle-name"><i class="fas fa-calendar-alt"></i> Theo tháng</div>
+<div class="cycle-name"><i class="fas fa-calendar-alt"></i> Tháng</div>
 <div class="cycle-price" id="renewPriceMonthly">--</div>
 </div>
 </div>
-<input type="hidden" name="billing_cycle" id="selectedRenewCycle" value="hourly">
+<div class="form-group" style="margin-top:12px;display:flex;align-items:center;gap:12px">
+<label style="margin:0;white-space:nowrap;font-weight:600">Số lượng gia hạn:</label>
+<input type="number" id="renewDurationInput" name="duration" value="1" min="1" style="width:100px;padding:10px;border:1px solid #cbd5e1;border-radius:8px;font-size:14px" oninput="updateRenewTotal()">
+<span style="color:#64748b;font-size:13px" id="renewDurationLabel">phút</span>
+</div>
+<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:12px;margin-top:10px;display:flex;justify-content:space-between;align-items:center">
+<span style="font-weight:600;color:#1e293b">Tổng tiền gia hạn:</span>
+<span id="renewTotalDisplay" style="font-size:18px;font-weight:800;color:#2563eb">0 VNĐ</span>
+</div>
+<input type="hidden" name="billing_cycle" id="selectedRenewCycle" value="minutely">
 </div>
 <button type="submit" class="btn-submit" id="renewSubmitBtn"><i class="fas fa-check-circle"></i> Xác nhận Gia hạn</button>
 </form>
@@ -3182,10 +3636,12 @@ window.addEventListener('DOMContentLoaded', () => {
     const shopCheckbox = document.getElementById('put_on_shop');
     const priceGroup = document.getElementById('shop_price_group');
     const quantityGroup = document.getElementById('shop_quantity_group');
+    const graceGroup = document.getElementById('shop_grace_group');
     if(shopCheckbox){
         shopCheckbox.addEventListener('change', (e) => {
             priceGroup.style.display = e.target.checked ? 'block' : 'none';
             quantityGroup.style.display = e.target.checked ? 'block' : 'none';
+            graceGroup.style.display = e.target.checked ? 'block' : 'none';
         });
     }
 });
@@ -3229,8 +3685,10 @@ function editConfig(key,cfg){
     document.getElementById('configCpu').value=cfg.cpu || 1;
     document.getElementById('configRam').value=cfg.ram || 1;
     document.getElementById('configDisk').value=cfg.disk || 1;
+    document.getElementById('configPriceMinutely').value=cfg.price_minutely || 0;
     document.getElementById('configPriceHourly').value=cfg.price_hourly || 0;
     document.getElementById('configPriceDaily').value=cfg.price_daily || 0;
+    document.getElementById('configPriceWeekly').value=cfg.price_weekly || 0;
     document.getElementById('configPriceMonthly').value=cfg.price_monthly || 0;
     document.getElementById('configModal').classList.add('active');
 }
@@ -3383,24 +3841,6 @@ function openNodeModal(){
     document.getElementById('nodeModal').classList.add('active');
 }
 function closeNodeModal(){ document.getElementById('nodeModal').classList.remove('active'); }
-function openEditNodeModal(nodeId, name, maxVms, enabled){
-    document.getElementById('editNodeModalTitle').innerText='Cài đặt: ' + name;
-    document.getElementById('editNodeId').value = nodeId;
-    document.getElementById('editNodeName').value = name;
-    document.getElementById('editNodeMaxVms').value = maxVms;
-    document.getElementById('editNodeEnabled').checked = enabled;
-    document.getElementById('editNodeModal').classList.add('active');
-}
-function closeEditNodeModal(){ document.getElementById('editNodeModal').classList.remove('active'); }
-function saveEditNode(e){
-    e.preventDefault();
-    const form = new FormData(e.target);
-    fetch('/api/admin/node/edit', {method:'POST', body:form})
-    .then(r=>r.json()).then(d=>{
-        if(d.success){ closeEditNodeModal(); showCenterNotice('Đã cập nhật Node thành công!', false, 1500, ()=>location.reload()); }
-        else showCenterNotice(d.error || 'Lỗi cập nhật Node!', true);
-    }).catch(()=>showCenterNotice('Không thể kết nối máy chủ!', true));
-}
 function saveNode(e){
     e.preventDefault();
     const form = new FormData(e.target);
@@ -3428,6 +3868,59 @@ function testNode(nodeId){
         else showCenterNotice(d.error || 'Kết nối thất bại!', true, 3000);
     }).catch(()=>showCenterNotice('Không thể kết nối máy chủ!', true));
 }
+
+// Key shop countdown updater
+(function(){
+  function updateKeyCountdowns(){
+    const now = Math.floor(Date.now()/1000);
+    document.querySelectorAll('.key-countdown').forEach(el=>{
+      const start = parseFloat(el.dataset.start);
+      const duration = parseInt(el.dataset.duration) || 2;
+      const mode = el.dataset.mode || 'soldout';
+      const elapsed = now - start;
+      const left = duration*60 - elapsed;
+      const label = mode === 'redeemed' ? 'để xóa' : 'để gỡ';
+      if(left <= 0){
+        el.textContent = mode === 'redeemed' ? "Đang xóa..." : "Đang gỡ...";
+        el.style.color = "#999";
+      } else {
+        const m = Math.floor(left/60);
+        const s = Math.floor(left%60);
+        el.textContent = `Còn ${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')} ${label}`;
+      }
+    });
+  }
+  setInterval(updateKeyCountdowns, 1000);
+  updateKeyCountdowns();
+})();
+
+// Admin countdown updater
+(function(){
+  function formatCountdown(ms){
+    if(ms <= 0) return "HẾT HẠN";
+    const totalSec = Math.floor(ms/1000);
+    const h = Math.floor(totalSec/3600);
+    const m = Math.floor((totalSec%3600)/60);
+    const s = totalSec%60;
+    return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  }
+  function updateAdminCountdowns(){
+    const now = new Date().getTime();
+    document.querySelectorAll('td[data-expiry]').forEach(td=>{
+      const expiry = td.dataset.expiry;
+      const span = td.querySelector('.admin-countdown');
+      if(!expiry || !span) return;
+      const end = new Date(expiry).getTime();
+      const diff = end - now;
+      span.textContent = formatCountdown(diff);
+      if(diff <= 600000) span.style.color = '#dc2626';
+      else if(diff <= 3600000) span.style.color = '#d97706';
+      else span.style.color = '#0369a1';
+    });
+  }
+  setInterval(updateAdminCountdowns, 1000);
+  updateAdminCountdowns();
+})();
 </script>
 <script>
 function adminDeleteVM(userId, vmId, vmName){
@@ -3548,15 +4041,20 @@ def my_vms():
             st = vm.get("status", "stopped")
             if st == "running":
                 running_count += 1
-                status_text = "Đang chạy"
+                status_text = "VM đang được khởi động lên"
             elif st == "creating":
                 creating_count += 1
-                status_text = "Đang khởi tạo"
+                status_text = "Đang Tạo VM"
             else:
-                status_text = "Đã dừng"
+                status_text = "VM Đã Dừng"
             os_name = vm.get("windows", {}).get("name", "Windows Server") if isinstance(vm.get("windows"), dict) else str(vm.get("windows"))
             billing = vm.get("billing_cycle", "monthly")
-            billing_text = {"hourly": "Theo giờ", "daily": "Theo ngày", "monthly": "Theo tháng"}.get(billing, billing)
+            try:
+                duration = max(1, int(vm.get("duration", 1) or 1))
+            except (ValueError, TypeError):
+                duration = 1
+            unit_labels = {"minutely": "phút", "hourly": "giờ", "daily": "ngày", "weekly": "tuần", "monthly": "tháng"}
+            billing_text = f"{duration} {unit_labels.get(billing, billing)}"
             expiry = vm.get("expiry_time", "")
             expiry_text = "Không giới hạn"
             is_expired = False
@@ -3583,49 +4081,15 @@ def my_vms():
                 "billing_cycle": billing,
                 "billing_text": billing_text,
                 "expiry_text": expiry_text,
+                "expiry_time": expiry,
                 "is_expired": is_expired,
                 "config": vm.get("config", {}),
                 "logs_locked": vm.get("logs_locked", settings.get("default_logs_locked", True))
             })
     nodes = get_nodes()
-    # Kiểm tra và đánh dấu node nào bị quá tải hoặc đã đầy
-    for nid, node in nodes.items():
-        if nid == "local":
-            status = get_local_resources()
-        else:
-            status = get_node_status(node)
-        node["_status"] = status
-        vm_count = get_vm_count_on_node(nid)
-        max_vms = node.get("max_vms", 0)
-        node["_vm_count"] = vm_count
-        node["_max_vms"] = max_vms
-        node["_overloaded"] = False
-        node["_full"] = False
-        if status.get("success"):
-            cpu_p = status.get("cpu_percent", 0) or 0
-            ram_p = status.get("ram_percent", 0) or 0
-            disk_p = status.get("disk_percent", 0) or 0
-            if cpu_p > 90 or ram_p > 90 or disk_p > 95:
-                node["_overloaded"] = True
-        if max_vms > 0 and vm_count >= max_vms:
-            node["_full"] = True
     for vm in user_vms:
         nid = vm.get("node_id", "local")
         vm["node_name"] = nodes.get(nid, {}).get("name", nid) if nid != "local" else "Local (Master)"
-    nodes_info = {}
-    for nid, node in nodes.items():
-        status = node.get("_status", {})
-        nodes_info[nid] = {
-            "name": node.get("name", nid),
-            "enabled": bool(node.get("enabled", True)),
-            "overloaded": bool(node.get("_overloaded", False)),
-            "full": bool(node.get("_full", False)),
-            "cpu": int(status.get("cpu_count", 0) or 0),
-            "ram": float(status.get("ram_total_gb", 0) or 0),
-            "disk": float(status.get("disk_total_gb", 0) or 0),
-            "vm_count": int(node.get("_vm_count", 0)),
-            "max_vms": int(node.get("_max_vms", 0))
-        }
     return render_template_string(
         MY_VMS_PAGE,
         username=user["username"],
@@ -3638,7 +4102,6 @@ def my_vms():
         vm_configs=get_vm_configs(),
         windows_images=get_windows_images(),
         nodes=nodes,
-        nodes_info=nodes_info,
         settings=settings
     )
 
@@ -3654,14 +4117,43 @@ def marketplace():
     keys_data = load_json(KEYS_FILE)
     shop_keys = {}
     batch_counts = {}
+    now = datetime.now()
     for k_code, k in keys_data.items():
-        if k.get("on_shop") and not k.get("used"):
+        if k.get("on_shop"):
+            # Kiểm tra hết hạn validity
+            valid = True
+            created_at = k.get("created_at")
+            validity_days = int(k.get("key_validity_days", 30) or 30)
+            if created_at:
+                try:
+                    if now > datetime.fromisoformat(created_at) + timedelta(days=validity_days):
+                        valid = False
+                except Exception:
+                    pass
+            if not valid:
+                continue
+            # Đếm stock: key chưa used = còn hàng, key đã used = hết hàng nhưng vẫn hiển thị để đếm ngược gỡ
             batch_id = k.get("batch_id", k_code)
-            batch_counts[batch_id] = batch_counts.get(batch_id, 0) + 1
+            if not k.get("used"):
+                batch_counts[batch_id] = batch_counts.get(batch_id, 0) + 1
     for k_code, k in keys_data.items():
-        if k.get("on_shop") and not k.get("used"):
+        if k.get("on_shop"):
+            # Kiểm tra hết hạn validity
+            valid = True
+            created_at = k.get("created_at")
+            validity_days = int(k.get("key_validity_days", 30) or 30)
+            if created_at:
+                try:
+                    if now > datetime.fromisoformat(created_at) + timedelta(days=validity_days):
+                        valid = False
+                except Exception:
+                    pass
+            if not valid:
+                continue
             batch_id = k.get("batch_id", k_code)
-            k["_shop_stock"] = batch_counts.get(batch_id, 1)
+            stock = batch_counts.get(batch_id, 0)
+            k["_shop_stock"] = stock
+            k["_is_sold_out"] = k.get("used", False)
             shop_keys[k_code] = k
     return render_template_string(
         MARKETPLACE_PAGE,
@@ -3706,30 +4198,12 @@ def admin_panel():
                 "username": u.get("username", "Unknown"),
                 "vm_id": vid,
                 "vm_name": vm.get("name", "VM"),
+                "expiry_time": vm.get("expiry_time", ""),
                 "logs_locked": vm.get("logs_locked", settings.get("default_logs_locked", True))
             })
     nodes = get_nodes()
-    all_vm_counts = {}
-    for nid in nodes:
-        all_vm_counts[nid] = get_vm_count_on_node(nid)
     for node_id, node in nodes.items():
-        if node_id == "local":
-            node["_status"] = get_local_resources()
-        else:
-            node["_status"] = get_node_status(node)
-        node["_vm_count"] = all_vm_counts.get(node_id, 0)
-        max_vms = node.get("max_vms", 0)
-        node["_max_vms"] = max_vms
-        node["_overloaded"] = False
-        node["_full"] = False
-        if node["_status"].get("success"):
-            cpu_p = node["_status"].get("cpu_percent", 0) or 0
-            ram_p = node["_status"].get("ram_percent", 0) or 0
-            disk_p = node["_status"].get("disk_percent", 0) or 0
-            if cpu_p > 90 or ram_p > 90 or disk_p > 95:
-                node["_overloaded"] = True
-        if max_vms > 0 and node["_vm_count"] >= max_vms:
-            node["_full"] = True
+        node["_status"] = get_node_status(node)
     return render_template_string(
         ADMIN_PAGE,
         username=user["username"],
@@ -3741,8 +4215,7 @@ def admin_panel():
         os_images=get_windows_images(),
         settings=settings,
         all_vms=all_vms,
-        nodes=nodes,
-        all_vm_counts=all_vm_counts
+        nodes=nodes
     )
 
 # ==================== API ENDPOINTS ====================
@@ -3757,8 +4230,12 @@ def api_create_vm():
     os_key = request.form.get("windows", "").strip()
     tailscale_key = request.form.get("tailscale_key", "").strip()
     billing_cycle = request.form.get("billing_cycle", "monthly").strip()
+    try:
+        duration = max(1, int(request.form.get("duration", 1)))
+    except (ValueError, TypeError):
+        duration = 1
     node_id = request.form.get("node_id", "local").strip()
-    if billing_cycle not in ("hourly", "daily", "monthly"):
+    if billing_cycle not in ("minutely", "hourly", "daily", "weekly", "monthly"):
         billing_cycle = "monthly"
     if not vm_name or not config_key or not os_key or not tailscale_key:
         return jsonify({"success": False, "error": "Vui lòng điền đầy đủ thông tin cấu hình và Tailscale Key."})
@@ -3770,25 +4247,21 @@ def api_create_vm():
     if os_key not in images:
         return jsonify({"success": False, "error": "Hệ điều hành không hợp lệ."})
     win_img = images[os_key]
-    price = get_price_for_cycle(cfg, billing_cycle)
+    unit_price = get_price_for_cycle(cfg, billing_cycle)
+    price = unit_price * duration
     if user["balance"] < price:
         return jsonify({"success": False, "error": f"Số dư tài khoản không đủ ({user['balance']:,.0f} VNĐ). Cần {price:,.0f} VNĐ để tạo gói này."})
     nodes = get_nodes()
     if node_id not in nodes or not nodes[node_id].get("enabled", True):
         return jsonify({"success": False, "error": "Server được chọn không hợp lệ hoặc đang tắt."})
     node = nodes[node_id]
-
-    # Kiểm tra giới hạn VM và tài nguyên node
-    can_fit, reason = check_node_can_fit(node_id, cfg)
-    if not can_fit:
-        return jsonify({"success": False, "error": reason})
     users = load_all_users()
     if user["id"] in users:
         users[user["id"]]["balance"] -= price
         save_user(user["id"], users[user["id"]])
     vid = str(uuid.uuid4())[:8]
     vm_dir = get_user_vm_dir(user["id"], vid)
-    expiry = calculate_expiry(billing_cycle).isoformat()
+    expiry = calculate_expiry(billing_cycle, duration).isoformat()
     vm_data = {
         "id": vid,
         "user_id": user["id"],
@@ -3800,6 +4273,7 @@ def api_create_vm():
         "tailscale_key": tailscale_key,
         "tailscale_ip": None,
         "billing_cycle": billing_cycle,
+        "duration": duration,
         "expiry_time": expiry,
         "logs_locked": get_settings().get("default_logs_locked", True),
         "node_id": node_id,
@@ -3897,18 +4371,7 @@ def api_stop_vm(vid):
         else:
             return jsonify({"success": False, "error": resp.get("error", "Worker lỗi")})
     vm_dir = get_user_vm_dir(user["id"], vid)
-    find_and_kill_qemu_for_vm(vm_dir)
-    with vm_lock:
-        if vid in active_vms and active_vms[vid].get("process"):
-            try:
-                active_vms[vid]["process"].terminate()
-                active_vms[vid]["process"].wait(timeout=5)
-            except Exception:
-                try:
-                    active_vms[vid]["process"].kill()
-                except Exception:
-                    pass
-        active_vms[vid]["status"] = "stopped"
+    _stop_vm_logged(user["id"], vid, vm_dir)
     vm_data["status"] = "stopped"
     save_vm_data(user["id"], vid, vm_data)
     return jsonify({"success": True, "message": "Đã dừng máy ảo và kill tiến trình QEMU."})
@@ -3932,20 +4395,8 @@ def api_delete_vm(vid):
         else:
             return jsonify({"success": False, "error": resp.get("error", "Worker lỗi")})
     vm_dir = get_user_vm_dir(user["id"], vid)
-    find_and_kill_qemu_for_vm(vm_dir)
-    with vm_lock:
-        if vid in active_vms and active_vms[vid].get("process"):
-            try:
-                active_vms[vid]["process"].terminate()
-                active_vms[vid]["process"].wait(timeout=5)
-            except Exception:
-                try:
-                    active_vms[vid]["process"].kill()
-                except Exception:
-                    pass
-        active_vms.pop(vid, None)
-    if vm_dir.exists():
-        shutil.rmtree(vm_dir, ignore_errors=True)
+    windows_key = vm_data.get("windows_key", "win11")
+    _delete_vm_logged(user["id"], vid, vm_dir, windows_key)
     return jsonify({"success": True, "message": "Đã xóa toàn bộ dữ liệu máy ảo."})
 
 
@@ -3958,22 +4409,50 @@ def api_renew_vm(vid):
     if not vm_data or vm_data.get("user_id") != user["id"]:
         return jsonify({"success": False, "error": "Không tìm thấy máy ảo."})
     billing_cycle = request.form.get("billing_cycle", "hourly").strip()
-    if billing_cycle not in ("hourly", "daily", "monthly"):
+    if billing_cycle not in ("minutely", "hourly", "daily", "weekly", "monthly"):
         billing_cycle = "hourly"
+    try:
+        duration = max(1, int(request.form.get("duration", 1)))
+    except (ValueError, TypeError):
+        duration = 1
     cfg = vm_data.get("config", {})
-    price = get_price_for_cycle(cfg, billing_cycle)
+    unit_price = get_price_for_cycle(cfg, billing_cycle)
+    price = unit_price * duration
     if user["balance"] < price:
         return jsonify({"success": False, "error": f"Số dư không đủ ({user['balance']:,.0f} VNĐ). Cần {price:,.0f} VNĐ để gia hạn."})
     users = load_all_users()
     if user["id"] in users:
         users[user["id"]]["balance"] -= price
         save_user(user["id"], users[user["id"]])
-    new_expiry = calculate_expiry(billing_cycle).isoformat()
+    new_expiry = calculate_expiry(billing_cycle, duration).isoformat()
     vm_data["billing_cycle"] = billing_cycle
+    vm_data["duration"] = duration
     vm_data["expiry_time"] = new_expiry
     save_vm_data(user["id"], vid, vm_data)
-    append_vm_log(user["id"], vid, f"[GIA HẠN] User gia hạn thêm 1 chu kỳ {billing_cycle}. Hết hạn mới: {new_expiry[:16]}")
+    append_vm_log(user["id"], vid, f"[GIA HẠN] User gia hạn thêm {duration} x {billing_cycle}. Hết hạn mới: {new_expiry[:16]}")
     return jsonify({"success": True, "message": f"Gia hạn thành công! Hết hạn mới: {new_expiry[:16].replace('T', ' ')}"})
+
+
+@app.route("/api/vm/<vid>/info", methods=["GET"])
+def api_vm_info(vid):
+    if not is_logged_in():
+        return jsonify({"success": False, "error": "Chưa đăng nhập"})
+    user = get_current_user()
+    vm_data = get_vm_data(user["id"], vid)
+    if not vm_data or vm_data.get("user_id") != user["id"]:
+        return jsonify({"success": False, "error": "Không tìm thấy máy ảo."})
+    cfg = vm_data.get("config", {})
+    return jsonify({
+        "success": True,
+        "config": {
+            "price_minutely": cfg.get("price_minutely", 0),
+            "price_hourly": cfg.get("price_hourly", 0),
+            "price_daily": cfg.get("price_daily", 0),
+            "price_weekly": cfg.get("price_weekly", 0),
+            "price_monthly": cfg.get("price_monthly", 0)
+        },
+        "expiry_time": vm_data.get("expiry_time", "")
+    })
 
 @app.route("/vm/<vid>/logs")
 def vm_logs_page(vid):
@@ -3992,13 +4471,12 @@ def vm_logs_page(vid):
     node = nodes.get(node_id)
     if node_id != "local" and node:
         try:
-            base_url = _get_node_url(node)
             r = requests.get(
-                f"{base_url}/worker/vm/{user['id']}/{vid}/logs",
+                f"http://{node['host']}:{node['port']}/worker/vm/{vid}/logs",
                 headers={"X-Worker-Token": node.get("token", "")},
-                timeout=15
+                timeout=10
             )
-            logs = r.text if r.status_code == 200 else f"Không thể lấy logs từ worker (HTTP {r.status_code})."
+            logs = r.text if r.status_code == 200 else "Không thể lấy logs từ worker."
         except Exception as e:
             logs = f"Lỗi kết nối worker: {e}"
     else:
@@ -4033,23 +4511,48 @@ def api_redeem_key():
     if code not in keys:
         return jsonify({"success": False, "error": "Mã Key không tồn tại trong hệ thống."})
     k = keys[code]
+    # Kiểm tra thờigian hiệu lực từ khi tạo
+    validity_days = int(k.get("key_validity_days", 30) or 30)
+    created_at = k.get("created_at", "")
+    if created_at:
+        try:
+            created_dt = datetime.fromisoformat(created_at)
+            if datetime.now() > created_dt + timedelta(days=validity_days):
+                return jsonify({"success": False, "error": f"Mã Key này đã hết hạn sử dụng (hiệu lực {validity_days} ngày)."})
+        except Exception:
+            pass
     uses_by_user = k.get("uses_by_user", {})
     if not isinstance(uses_by_user, dict):
         uses_by_user = {}
     user_key = str(user["id"])
     current_user_uses = int(uses_by_user.get(user_key, 0) or 0)
     max_uses_per_user = int(k.get("max_uses_per_user", 1) or 1)
+    max_total_uses = int(k.get("max_total_uses", 1) or 1)
     if max_uses_per_user < 1:
         max_uses_per_user = 1
+    if max_total_uses < 1:
+        max_total_uses = 1
     if current_user_uses >= max_uses_per_user:
         return jsonify({"success": False, "error": f"Bạn đã nhập Key này đủ {max_uses_per_user} lần."})
-    if k.get("used") and max_uses_per_user <= 1:
+    total_uses = sum(int(v or 0) for v in uses_by_user.values())
+    if total_uses >= max_total_uses:
+        return jsonify({"success": False, "error": f"Key này đã đạt giới hạn {max_total_uses} lượt sử dụng."})
+    if k.get("used") and max_uses_per_user <= 1 and max_total_uses <= 1:
         return jsonify({"success": False, "error": "Mã Key này đã được sử dụng trước đó."})
     uses_by_user[user_key] = current_user_uses + 1
     k["uses_by_user"] = uses_by_user
     k["last_used_by"] = user["username"]
     k["last_used_at"] = datetime.now().isoformat()
-    if max_uses_per_user == 1:
+    new_total = sum(int(v or 0) for v in uses_by_user.values())
+    # Bắt đầu countdown thờigian sống khi lần đầu được nhập
+    if not k.get("redeemed_at"):
+        k["redeemed_at"] = time.time()
+    # Nếu đạt tổng số lượt tối đa → đánh dấu đã dùng hết để không cho nhập nữa
+    if new_total >= max_total_uses:
+        k["used"] = True
+        k["used_by"] = user["username"]
+        k["used_at"] = datetime.now().isoformat()
+    elif max_uses_per_user == 1 and max_total_uses == 1:
         k["used"] = True
         k["used_by"] = user["username"]
         k["used_at"] = datetime.now().isoformat()
@@ -4103,7 +4606,11 @@ def api_buy_key_shop():
     if user["id"] in users:
         users[user["id"]]["balance"] -= price
         save_user(user["id"], users[user["id"]])
-    k["on_shop"] = False
+    k["used"] = True
+    k["used_by"] = user["username"]
+    k["used_at"] = datetime.now().isoformat()
+    k["sold_out_at"] = time.time()
+    # KHÔNG đặt on_shop = False ngay — để cleanup worker gỡ sau shop_grace_minutes
     save_json(KEYS_FILE, keys)
     return jsonify({"success": True})
 
@@ -4253,42 +4760,6 @@ def sepay_webhook():
         print(f"[SEPAY WEBHOOK ERROR] {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
-# ==================== WORKER REGISTRATION ENDPOINT ====================
-@app.route("/api/worker/register", methods=["POST"])
-def api_worker_register():
-    """Worker Node gọi đến để đăng ký / cập nhật kết nối với Master"""
-    name = request.form.get("name", "").strip()
-    tunnel_url = request.form.get("tunnel_url", "").strip().rstrip("/")
-    token = request.form.get("token", "").strip()
-    node_id = request.form.get("node_id", "").strip()
-
-    if not name or not tunnel_url or not token:
-        return jsonify({"success": False, "error": "Thiếu thông tin bắt buộc (name, tunnel_url, token)."})
-
-    nodes = get_nodes()
-    # Tạo node_id duy nhất nếu chưa có
-    if not node_id or node_id not in nodes:
-        base_id = re.sub(r'[^a-z0-9_-]', '', name.lower().replace(' ', '-')) or "node"
-        node_id = base_id
-        counter = 1
-        while node_id in nodes:
-            node_id = f"{base_id}-{counter}"
-            counter += 1
-
-    nodes[node_id] = {
-        "name": name,
-        "tunnel_url": tunnel_url,
-        "host": "127.0.0.1",
-        "port": WORKER_PORT,
-        "type": "worker",
-        "enabled": True,
-        "token": token,
-        "max_vms": 0
-    }
-    save_nodes(nodes)
-    print(f"[MASTER] Worker registered: {node_id} -> {tunnel_url}")
-    return jsonify({"success": True, "node_id": node_id, "message": "Node đã được kết nối với Master thành công."})
-
 # ==================== ADMIN API ENDPOINTS ====================
 
 @app.route("/api/admin/settings", methods=["POST"])
@@ -4301,6 +4772,10 @@ def api_admin_settings():
     settings["default_logs_locked"] = request.form.get("default_logs_locked") == "on"
     settings["allow_registration"] = request.form.get("allow_registration") == "on"
     settings["maintenance_mode"] = request.form.get("maintenance_mode") == "on"
+    try:
+        settings["marketplace_cleanup_minutes"] = max(1, int(request.form.get("marketplace_cleanup_minutes", 2)))
+    except (ValueError, TypeError):
+        settings["marketplace_cleanup_minutes"] = 2
     save_settings(settings)
     return jsonify({"success": True})
 
@@ -4319,12 +4794,14 @@ def api_admin_config_save():
         cpu = int(request.form.get("cpu", 0))
         ram = int(request.form.get("ram", 0))
         disk = int(request.form.get("disk", 0))
+        price_minutely = float(request.form.get("price_minutely", 0))
         price_hourly = float(request.form.get("price_hourly", 0))
         price_daily = float(request.form.get("price_daily", 0))
+        price_weekly = float(request.form.get("price_weekly", 0))
         price_monthly = float(request.form.get("price_monthly", 0))
     except (TypeError, ValueError):
         return jsonify({"success": False, "error": "CPU/RAM/SSD/Giá phải là số hợp lệ."})
-    if cpu < 1 or ram < 1 or disk < 1 or price_hourly < 0 or price_daily < 0 or price_monthly < 0:
+    if cpu < 1 or ram < 1 or disk < 1 or price_minutely < 0 or price_hourly < 0 or price_daily < 0 or price_weekly < 0 or price_monthly < 0:
         return jsonify({"success": False, "error": "CPU, RAM, SSD phải >= 1 và giá không được âm."})
     configs = load_json(CONFIGS_FILE)
     target_key = original_key or key
@@ -4338,8 +4815,10 @@ def api_admin_config_save():
         "cpu": cpu,
         "ram": ram,
         "disk": disk,
+        "price_minutely": price_minutely,
         "price_hourly": price_hourly,
         "price_daily": price_daily,
+        "price_weekly": price_weekly,
         "price_monthly": price_monthly
     })
     configs[target_key] = cfg
@@ -4398,20 +4877,8 @@ def api_admin_delete_vm():
     if not vm_data:
         return jsonify({"success": False, "error": "Không tìm thấy VM."})
     vm_dir = get_user_vm_dir(user_id, vm_id)
-    find_and_kill_qemu_for_vm(vm_dir)
-    with vm_lock:
-        if vm_id in active_vms and active_vms[vm_id].get("process"):
-            try:
-                active_vms[vm_id]["process"].terminate()
-                active_vms[vm_id]["process"].wait(timeout=5)
-            except Exception:
-                try:
-                    active_vms[vm_id]["process"].kill()
-                except Exception:
-                    pass
-        active_vms.pop(vm_id, None)
-    if vm_dir.exists():
-        shutil.rmtree(vm_dir, ignore_errors=True)
+    windows_key = vm_data.get("windows_key", "win11")
+    _delete_vm_logged(user_id, vm_id, vm_dir, windows_key)
     return jsonify({"success": True, "message": "Đã xóa VM thành công."})
 
 @app.route("/api/admin/keys/create", methods=["POST"])
@@ -4424,15 +4891,27 @@ def api_admin_create_key():
     try:
         shop_price = float(request.form.get("shop_price", 0))
         quantity = int(request.form.get("quantity", 1))
+        shop_grace_minutes = int(request.form.get("shop_grace_minutes", 2))
+        key_lifetime_minutes = int(request.form.get("key_lifetime_minutes", 60))
+        key_validity_days = int(request.form.get("key_validity_days", 30))
         max_uses_per_user = int(request.form.get("max_uses_per_user", 1))
+        max_total_uses = int(request.form.get("max_total_uses", 1))
     except (TypeError, ValueError):
-        return jsonify({"success": False, "error": "Giá, số lượng Key và số lần/User phải là số hợp lệ."})
+        return jsonify({"success": False, "error": "Giá, số lượng Key, thờigian và số lần/User phải là số hợp lệ."})
     if not code:
         return jsonify({"success": False, "error": "Vui lòng nhập mã Key."})
     if quantity < 1:
         return jsonify({"success": False, "error": "Số lượng Key phải >= 1."})
+    if shop_grace_minutes < 1:
+        shop_grace_minutes = 2
+    if key_lifetime_minutes < 1:
+        key_lifetime_minutes = 60
+    if key_validity_days < 1:
+        key_validity_days = 30
     if max_uses_per_user < 1:
         return jsonify({"success": False, "error": "Số lần 1 User nhập Key phải >= 1."})
+    if max_total_uses < 1:
+        return jsonify({"success": False, "error": "Tổng số lượt nhập Key phải >= 1."})
     if not put_on_shop:
         quantity = 1
     keys = load_json(KEYS_FILE)
@@ -4447,9 +4926,13 @@ def api_admin_create_key():
         "type": key_type,
         "on_shop": put_on_shop,
         "shop_price": shop_price,
+        "shop_grace_minutes": shop_grace_minutes,
+        "key_lifetime_minutes": key_lifetime_minutes,
+        "key_validity_days": key_validity_days,
         "used": False,
         "used_by": None,
         "max_uses_per_user": max_uses_per_user,
+        "max_total_uses": max_total_uses,
         "uses_by_user": {},
         "batch_id": batch_id,
         "batch_quantity": quantity,
@@ -4554,6 +5037,7 @@ def api_admin_node_save():
     host = request.form.get("host", "").strip()
     port = request.form.get("port", str(WORKER_PORT)).strip()
     token = request.form.get("token", "").strip()
+    tunnel_url = request.form.get("tunnel_url", "").strip()
     enabled = request.form.get("enabled") == "on"
     if not node_id or not name or not host:
         return jsonify({"success": False, "error": "Vui lòng điền đầy đủ thông tin node."})
@@ -4564,19 +5048,17 @@ def api_admin_node_save():
     except ValueError:
         port = WORKER_PORT
     nodes = get_nodes()
-    try:
-        max_vms = int(request.form.get("max_vms", "0").strip())
-    except ValueError:
-        max_vms = 0
-    nodes[node_id] = {
+    node_data = {
         "name": name,
         "host": host,
         "port": port,
         "type": "worker",
         "enabled": enabled,
-        "token": token,
-        "max_vms": max_vms
+        "token": token
     }
+    if tunnel_url:
+        node_data["tunnel_url"] = tunnel_url
+    nodes[node_id] = node_data
     save_nodes(nodes)
     return jsonify({"success": True})
 
@@ -4594,29 +5076,6 @@ def api_admin_node_delete():
         return jsonify({"success": True})
     return jsonify({"success": False, "error": "Node không tồn tại."})
 
-@app.route("/api/admin/node/edit", methods=["POST"])
-def api_admin_node_edit():
-    if not is_admin():
-        return jsonify({"success": False, "error": "Unauthorized"})
-    node_id = request.form.get("node_id", "").strip()
-    name = request.form.get("name", "").strip()
-    enabled = request.form.get("enabled") == "on"
-    try:
-        max_vms = int(request.form.get("max_vms", "0").strip())
-        if max_vms < 0:
-            max_vms = 0
-    except ValueError:
-        max_vms = 0
-    nodes = get_nodes()
-    if node_id not in nodes:
-        return jsonify({"success": False, "error": "Node không tồn tại."})
-    if name:
-        nodes[node_id]["name"] = name
-    nodes[node_id]["enabled"] = enabled
-    nodes[node_id]["max_vms"] = max_vms
-    save_nodes(nodes)
-    return jsonify({"success": True, "message": "Đã cập nhật Node."})
-
 @app.route("/api/admin/node/test", methods=["POST"])
 def api_admin_node_test():
     if not is_admin():
@@ -4631,6 +5090,38 @@ def api_admin_node_test():
         return jsonify({"success": True, "status": status, "message": f"Kết nối thành công đến {node['name']}!"})
     else:
         return jsonify({"success": False, "error": f"Không thể kết nối đến {node['name']} ({node['host']}:{node['port']})."})
+
+@app.route("/api/worker/register", methods=["POST"])
+def api_worker_register():
+    """Worker tự đăng ký với Master, dùng worker token để xác thực."""
+    token = request.form.get("worker_token", "").strip()
+    if token != get_worker_token():
+        return jsonify({"success": False, "error": "Invalid worker token"}), 403
+    node_id = request.form.get("node_id", "").strip()
+    name = request.form.get("name", "").strip()
+    host = request.form.get("host", "").strip()
+    port = request.form.get("port", str(WORKER_PORT)).strip()
+    tunnel_url = request.form.get("tunnel_url", "").strip()
+    if not node_id or not name or not host:
+        return jsonify({"success": False, "error": "Thiếu thông tin node."})
+    try:
+        port = int(port)
+    except ValueError:
+        port = WORKER_PORT
+    nodes = get_nodes()
+    node_data = {
+        "name": name,
+        "host": host,
+        "port": port,
+        "type": "worker",
+        "enabled": True,
+        "token": token
+    }
+    if tunnel_url:
+        node_data["tunnel_url"] = tunnel_url
+    nodes[node_id] = node_data
+    save_nodes(nodes)
+    return jsonify({"success": True, "message": "Worker đã đăng ký thành công."})
 
 
 # ==================== ADMIN VM MANAGEMENT ====================
@@ -4647,7 +5138,7 @@ def admin_user_vms(user_id):
     vms = []
     for vid, vm in user_vms_raw.items():
         st = vm.get("status", "stopped")
-        status_text = {"running": "Đang chạy", "creating": "Đang khởi tạo"}.get(st, "Đã dừng")
+        status_text = {"running": "VM đang được khởi động lên", "creating": "Đang Tạo VM"}.get(st, "VM Đã Dừng")
         os_name = vm.get("windows", {}).get("name", "Windows Server") if isinstance(vm.get("windows"), dict) else str(vm.get("windows"))
         vms.append({
             "id": vid,
@@ -4687,23 +5178,7 @@ def admin_view_vm(user_id, vid):
     target_user = users.get(user_id, {"username": "Unknown"})
     settings = get_settings()
     current_user = get_current_user()
-    # Lấy logs: nếu VM chạy trên Worker → gọi Worker, nếu local → đọc file
-    node_id = vm_data.get("node_id", "local")
-    nodes = get_nodes()
-    node = nodes.get(node_id)
-    if node_id != "local" and node:
-        try:
-            base_url = _get_node_url(node)
-            r = requests.get(
-                f"{base_url}/worker/vm/{user_id}/{vid}/logs",
-                headers={"X-Worker-Token": node.get("token", "")},
-                timeout=15
-            )
-            logs = r.text if r.status_code == 200 else f"Không thể lấy logs từ worker (HTTP {r.status_code})."
-        except Exception as e:
-            logs = f"Lỗi kết nối worker: {e}"
-    else:
-        logs = get_vm_logs(user_id, vid)
+    logs = get_vm_logs(user_id, vid)
     # Lấy trạng thái real-time từ active_vms nếu có
     realtime_status = "unknown"
     with vm_lock:
@@ -4726,22 +5201,7 @@ def admin_view_vm_logs(user_id, vid):
     vm_data = get_vm_data(user_id, vid)
     if not vm_data:
         return "Not found", 404
-    node_id = vm_data.get("node_id", "local")
-    nodes = get_nodes()
-    node = nodes.get(node_id)
-    if node_id != "local" and node:
-        try:
-            base_url = _get_node_url(node)
-            r = requests.get(
-                f"{base_url}/worker/vm/{user_id}/{vid}/logs",
-                headers={"X-Worker-Token": node.get("token", "")},
-                timeout=15
-            )
-            logs = r.text if r.status_code == 200 else f"Không thể lấy logs từ worker (HTTP {r.status_code})."
-        except Exception as e:
-            logs = f"Lỗi kết nối worker: {e}"
-    else:
-        logs = get_vm_logs(user_id, vid)
+    logs = get_vm_logs(user_id, vid)
     return """<!DOCTYPE html>
 <html lang="vi">
 <head>
@@ -4797,14 +5257,35 @@ def worker_create_vm():
     config_json = request.form.get("config", "{}")
     windows_key = request.form.get("windows_key", "win11").strip()
     tailscale_key = request.form.get("tailscale_key", "").strip()
+    billing_cycle = request.form.get("billing_cycle", "monthly").strip()
+    if billing_cycle not in ("hourly", "daily", "monthly"):
+        billing_cycle = "monthly"
     try:
         config = json.loads(config_json)
     except Exception:
         config = {"cpu": 2, "ram": 4, "disk": 50}
     images = get_windows_images()
     win_img = images.get(windows_key, list(images.values())[0])
-    # Không lưu vm_data ban đầu ở đây — Master đã lưu đầy đủ kèm node_id đúng.
-    # Worker chỉ cần bắt đầu chạy VM, run_winbox_script sẽ tự đọc & cập nhật status.
+    vm_dir = get_user_vm_dir(user_id, vm_id)
+    expiry = calculate_expiry(billing_cycle, duration).isoformat()
+    vm_data = {
+        "id": vm_id,
+        "user_id": user_id,
+        "name": vm_name,
+        "config": config,
+        "windows": win_img,
+        "windows_key": windows_key,
+        "status": "creating",
+        "tailscale_key": tailscale_key,
+        "tailscale_ip": None,
+        "billing_cycle": billing_cycle,
+        "duration": duration,
+        "expiry_time": expiry,
+        "logs_locked": True,
+        "node_id": "local",
+        "created_at": datetime.now().isoformat()
+    }
+    save_vm_data(user_id, vm_id, vm_data)
     t = threading.Thread(target=run_winbox_script, args=(user_id, vm_id, config, win_img, tailscale_key, vm_name, windows_key))
     t.daemon = True
     t.start()
@@ -4852,19 +5333,7 @@ def worker_stop_vm():
     user_id = request.form.get("user_id", "").strip()
     vm_id = request.form.get("vm_id", "").strip()
     vm_dir = get_user_vm_dir(user_id, vm_id)
-    find_and_kill_qemu_for_vm(vm_dir)
-    with vm_lock:
-        if vm_id in active_vms and active_vms[vm_id].get("process"):
-            try:
-                active_vms[vm_id]["process"].terminate()
-                active_vms[vm_id]["process"].wait(timeout=5)
-            except Exception:
-                try:
-                    active_vms[vm_id]["process"].kill()
-                except Exception:
-                    pass
-        if vm_id in active_vms:
-            active_vms[vm_id]["status"] = "stopped"
+    _stop_vm_logged(user_id, vm_id, vm_dir)
     vm_data = get_vm_data(user_id, vm_id)
     if vm_data:
         vm_data["status"] = "stopped"
@@ -4879,35 +5348,30 @@ def worker_delete_vm():
     user_id = request.form.get("user_id", "").strip()
     vm_id = request.form.get("vm_id", "").strip()
     vm_dir = get_user_vm_dir(user_id, vm_id)
-    find_and_kill_qemu_for_vm(vm_dir)
-    with vm_lock:
-        if vm_id in active_vms and active_vms[vm_id].get("process"):
-            try:
-                active_vms[vm_id]["process"].terminate()
-                active_vms[vm_id]["process"].wait(timeout=5)
-            except Exception:
-                try:
-                    active_vms[vm_id]["process"].kill()
-                except Exception:
-                    pass
-        active_vms.pop(vm_id, None)
-    if vm_dir.exists():
-        shutil.rmtree(vm_dir, ignore_errors=True)
+    windows_key = request.form.get("windows_key", "win11").strip()
+    _delete_vm_logged(user_id, vm_id, vm_dir, windows_key)
     return jsonify({"success": True, "message": "Đã xóa máy ảo."})
 
-@worker_app.route("/worker/vm/<user_id>/<vid>/logs", methods=["GET"])
-def worker_vm_logs(user_id, vid):
+@worker_app.route("/worker/vm/<vid>/logs", methods=["GET"])
+def worker_vm_logs(vid):
     token = request.headers.get("X-Worker-Token", "")
     if token != get_worker_token():
         return "Invalid token", 403
-    log_path = get_user_vm_dir(user_id, vid) / "logs.txt"
-    if log_path.exists():
-        try:
-            with open(log_path, "r", encoding="utf-8") as f:
-                return f.read()
-        except Exception as e:
-            return f"Lỗi đọc logs: {e}", 500
-    return "Chưa có log. (VM có thể đang khởi tạo hoặc chưa ghi log đầu tiên)"
+    # user_id không có trong URL, nhưng logs lưu theo user_id/vm_id
+    # Ta sẽ tìm trong tất cả users để lấy logs
+    logs = "Không tìm thấy logs."
+    if USERS_DIR.exists():
+        for user_dir in USERS_DIR.iterdir():
+            if user_dir.is_dir():
+                log_path = user_dir / "vms" / vid / "logs.txt"
+                if log_path.exists():
+                    try:
+                        with open(log_path, "r", encoding="utf-8") as f:
+                            logs = f.read()
+                        break
+                    except Exception:
+                        pass
+    return logs
 
 @worker_app.route("/worker/status", methods=["GET"])
 def worker_status():
@@ -4922,7 +5386,6 @@ def worker_status():
         return jsonify({
             "success": True,
             "online": True,
-            "cpu_count": psutil.cpu_count(),
             "cpu_percent": cpu,
             "ram_used_gb": round(mem.used / (1024**3), 2),
             "ram_total_gb": round(mem.total / (1024**3), 2),
@@ -4933,6 +5396,61 @@ def worker_status():
         })
     except ImportError:
         return jsonify({"success": True, "online": True, "note": "psutil not installed"})
+
+# ==================== WORKER AUTO SETUP ====================
+def get_local_ip():
+    try:
+        s = subprocess.run(["hostname", "-I"], capture_output=True, text=True)
+        ips = s.stdout.strip().split()
+        return ips[0] if ips else "127.0.0.1"
+    except Exception:
+        return "127.0.0.1"
+
+def start_worker_tunnel(port=5001, timeout=60):
+    """Start cloudflared tunnel for worker and return the public URL."""
+    cf_path = get_cloudflared_path()
+    if not cf_path:
+        return None
+    print(f"[WORKER TUNNEL] Đang khởi động Cloudflare Tunnel cho Worker trên port {port}...")
+    try:
+        proc = subprocess.Popen(
+            [cf_path, "tunnel", "--url", f"http://localhost:{port}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+        url_pattern = re.compile(r'(https://[a-zA-Z0-9-]+\.trycloudflare\.com)')
+        start_time = time.time()
+        for line in proc.stdout:
+            line = line.strip()
+            if line:
+                print(f"[CLOUDFLARED] {line}")
+                match = url_pattern.search(line)
+                if match:
+                    return match.group(1), proc
+            if time.time() - start_time > timeout:
+                print("[WORKER TUNNEL] Hết thờigian chờ tunnel.")
+                proc.terminate()
+                return None, None
+    except Exception as e:
+        print(f"[WORKER TUNNEL] Lỗi: {e}")
+    return None, None
+
+def register_worker_to_master(master_url, node_info, tunnel_url=""):
+    try:
+        payload = dict(node_info)
+        payload["worker_token"] = get_worker_token()
+        if tunnel_url:
+            payload["tunnel_url"] = tunnel_url
+        r = requests.post(
+            f"{master_url.rstrip('/')}/api/worker/register",
+            data=payload,
+            timeout=15
+        )
+        return r.json()
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 # ==================== CLOUDFLARE TUNNEL (FREE) ====================
 def get_cloudflared_path():
@@ -5020,99 +5538,60 @@ if __name__ == "__main__":
     choice = input("  Chọn mode (1/2) [mặc định: 1]: ").strip()
     if choice == "2":
         # WORKER MODE
-        print("\n" + "=" * 65)
-        print("  WINBOX MANAGER - WORKER NODE SETUP")
+        init_default_admin()
+        print("\n[WORKER] Khởi động Worker Node...")
         print("=" * 65)
-        master_url = input("  Nhập link Tunnel của Master Node\n  (vd: https://abc.trycloudflare.com): ").strip()
-        if not master_url:
-            print("  [ERROR] Bạn phải nhập link Tunnel của Master!")
-            sys.exit(1)
-        master_url = master_url.rstrip("/")
-        node_name = input("  Nhập tên cho Worker Node này (vd: Server HCM): ").strip() or "Worker Node"
+        print("[WORKER] Bạn có thể nhập Tunnel URL sẵn hoặc để trống để tự động tạo.")
+        manual_tunnel = input("  Nhập Tunnel URL (để trống = tự tạo): ").strip()
+        master_url = input("  Nhập Master URL (để trống nếu tự thêm tay): ").strip()
 
-        # Tạo token riêng cho worker
-        worker_token = secrets.token_hex(32)
-        token_file = DATA_DIR / "worker_token.json"
-        save_json(token_file, {"token": worker_token})
+        node_name = f"Worker-{secrets.token_hex(3).upper()}"
+        local_ip = get_local_ip()
+        tunnel_url = manual_tunnel
+        tunnel_proc = None
 
-        # Khởi động worker Flask app trong thread riêng
-        def run_worker_app():
-            worker_app.run(host="0.0.0.0", port=WORKER_PORT, debug=False, use_reloader=False)
+        if not tunnel_url:
+            tunnel_url, tunnel_proc = start_worker_tunnel(WORKER_PORT)
+            if not tunnel_url:
+                print("[WORKER] Không thể tạo tunnel tự động. Bạn cần cung cấp Tunnel URL thủ công.")
+                tunnel_url = input("  Nhập Tunnel URL thủ công: ").strip()
 
-        worker_thread = threading.Thread(target=run_worker_app, daemon=True)
-        worker_thread.start()
-        print(f"\n[WORKER] Flask app đang chạy ở port {WORKER_PORT}")
+        node_id = f"worker_{secrets.token_hex(4)}"
+        node_info = {
+            "node_id": node_id,
+            "name": node_name,
+            "host": local_ip,
+            "port": str(WORKER_PORT),
+            "token": get_worker_token(),
+            "enabled": "on"
+        }
 
-        # Khởi động Cloudflare Tunnel cho Worker
-        print("[WORKER] Đang khởi động Cloudflare Tunnel cho Worker...")
-        cf_path = get_cloudflared_path()
-        if not cf_path:
-            print("[ERROR] Không thể tải cloudflared. Worker không thể tạo tunnel.")
-            sys.exit(1)
+        print("\n" + "=" * 65)
+        print("  THÔNG TIN WORKER NODE (Copy vào Admin Panel nếu cần)")
+        print("=" * 65)
+        print(f"  Node ID   : {node_id}")
+        print(f"  Name      : {node_name}")
+        print(f"  Host      : {local_ip}")
+        print(f"  Port      : {WORKER_PORT}")
+        print(f"  Token     : {get_worker_token()}")
+        print(f"  Tunnel URL: {tunnel_url or 'Không có'}")
+        print("=" * 65)
 
-        proc = subprocess.Popen(
-            [cf_path, "tunnel", "--url", f"http://localhost:{WORKER_PORT}"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1
-        )
-
-        url_pattern = re.compile(r'(https://[a-zA-Z0-9-]+\.trycloudflare\.com)')
-        worker_tunnel_url = None
-        for line in proc.stdout:
-            line = line.strip()
-            if line:
-                print(f"[CLOUDFLARED] {line}")
-                match = url_pattern.search(line)
-                if match:
-                    worker_tunnel_url = match.group(1)
-                    break
-
-        if not worker_tunnel_url:
-            print("[ERROR] Không thể lấy Worker Tunnel URL.")
-            sys.exit(1)
-
-        print(f"\n[WORKER] Worker Tunnel URL: {worker_tunnel_url}")
-
-        # Đăng ký với Master
-        print("[WORKER] Đang đăng ký với Master Node...")
-        try:
-            resp = requests.post(
-                f"{master_url}/api/worker/register",
-                data={
-                    "name": node_name,
-                    "tunnel_url": worker_tunnel_url,
-                    "token": worker_token
-                },
-                timeout=30
-            )
-            result = resp.json()
-            if result.get("success"):
-                print("\n" + "=" * 65)
-                print("  ✅ NODE ĐÃ KẾT NỐI VỚI MASTER!")
-                print(f"  Node ID:    {result.get('node_id')}")
-                print(f"  Node Name:  {node_name}")
-                print(f"  Master URL: {master_url}")
-                print(f"  Worker URL: {worker_tunnel_url}")
-                print("=" * 65)
-                print("\n  Giữ terminal này mở để duy trì kết nối.")
-                print("  Nhấn Ctrl+C để dừng Worker.\n")
+        if master_url and tunnel_url:
+            print("[WORKER] Đang tự động đăng ký với Master...")
+            reg = register_worker_to_master(master_url, node_info, tunnel_url)
+            if reg.get("success"):
+                print("[WORKER] Đăng ký với Master thành công!")
             else:
-                print(f"[ERROR] Đăng ký thất bại: {result.get('error')}")
-                sys.exit(1)
-        except Exception as e:
-            print(f"[ERROR] Không thể kết nối đến Master: {e}")
-            sys.exit(1)
+                print(f"[WORKER] Đăng ký thất bại: {reg.get('error','Unknown error')}")
+                print("[WORKER] Vui lòng thêm node thủ công qua Admin Panel.")
+        else:
+            print("[WORKER] Hãy thêm node này vào Master qua Admin Panel (hoặc cung cấp Master URL lần sau).")
+        print("=" * 65)
 
-        # Giữ chương trình chạy
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            print("\n[WORKER] Đang dừng Worker Node...")
-            proc.terminate()
-            sys.exit(0)
+        worker_app.run(host="0.0.0.0", port=WORKER_PORT, debug=False, use_reloader=False)
+        if tunnel_proc:
+            tunnel_proc.terminate()
     else:
         # MASTER MODE
         init_default_admin()
