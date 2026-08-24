@@ -1,10 +1,6 @@
 #!/bin/bash
 # =============================================================================
 # WINBOX MANAGER - Self-Extracting Shell Script
-# Mô tả: Web Interface for VM Management (Flask App)
-# Tính năng: Tạo VM, quản lý VM, Chợ VPS, Tailscale, User & Số dư VNĐ,
-#            Giftcode/Random Keys, Nạp tiền Sepay/VietQR, Bảng tin, Thuê VPS,
-#            Khóa/mở logs VM, Thư mục User & VM riêng biệt.
 # =============================================================================
 
 set -e
@@ -19,13 +15,28 @@ if ! command -v python3 &> /dev/null; then
     exit 1
 fi
 
+# Đảm bảo pip có sẵn
+echo "[WinBox] Kiểm tra pip..."
+if ! python3 -m pip --version &> /dev/null 2>&1; then
+    echo "[WinBox] pip chưa có. Đang cài đặt pip..."
+    python3 -m ensurepip --upgrade 2>/dev/null || {
+        echo "[WinBox] ensurepip thất bại. Đang tải get-pip.py..."
+        curl -fsSL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py 2>/dev/null || \
+        wget -q https://bootstrap.pypa.io/get-pip.py -O /tmp/get-pip.py 2>/dev/null || {
+            echo "[LỖI] Không thể tải get-pip.py. Kiểm tra kết nối mạng."
+            exit 1
+        }
+        python3 /tmp/get-pip.py --quiet
+    }
+fi
+
 # Kiểm tra và cài đặt thư viện cần thiết
 echo "[WinBox] Kiểm tra dependencies..."
 for pkg in flask requests psutil; do
     python3 -c "import $pkg" 2>/dev/null || {
         echo "[WinBox] Đang cài đặt $pkg..."
-        pip3 install "$pkg" -q 2>/dev/null || python3 -m pip install "$pkg" -q 2>/dev/null || {
-            echo "[LỖI] Không thể cài đặt $pkg. Vui lòng cài thủ công: pip3 install $pkg"
+        python3 -m pip install "$pkg" -q 2>/dev/null || {
+            echo "[LỖI] Không thể cài đặt $pkg."
             exit 1
         }
     }
@@ -5649,13 +5660,10 @@ if __name__ == "__main__":
         print("  Đang chờ Cloudflare Tunnel khởi động (khoảng 5-10 giây)...")
         print("=" * 65)
         app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
+
 PYEOF_38f7a2b9c1d4e5f6
 
 echo "[WinBox] Đang khởi động Flask server..."
 echo "[WinBox] ================================================"
 
-# Chạy ứng dụng
 python3 "$PY_FILE" "$@"
-
-# Dọn dẹp (tùy chọn, comment nếu muốn giữ file debug)
-# rm -rf "$TMP_DIR"
