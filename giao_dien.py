@@ -23,20 +23,20 @@ import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 
-# ==================== FLASK IMPORTS ====================
-try:
-    from flask import Flask, render_template_string, request, jsonify, redirect, session, flash
-except ImportError:
-    print("[ERROR] Flask chưa được cài đặt. Đang tiến hành cài đặt...")
-    subprocess.run([sys.executable, "-m", "pip", "install", "flask", "-q"], check=True)
-    from flask import Flask, render_template_string, request, jsonify, redirect, session, flash
+# ==================== AUTO INSTALL DEPENDENCIES ====================
+REQUIRED_PACKAGES = ["flask", "requests", "psutil"]
+for pkg in REQUIRED_PACKAGES:
+    try:
+        __import__(pkg)
+    except ImportError:
+        print(f"[AUTO-INSTALL] Thư viện '{pkg}' chưa có. Đang cài đặt...")
+        subprocess.run([sys.executable, "-m", "pip", "install", pkg, "-q"], check=True)
+        print(f"[AUTO-INSTALL] Đã cài đặt xong '{pkg}'.")
 
-try:
-    import requests
-except ImportError:
-    print("[ERROR] requests chưa được cài đặt. Đang tiến hành cài đặt...")
-    subprocess.run([sys.executable, "-m", "pip", "install", "requests", "-q"], check=True)
-    import requests
+# ==================== FLASK IMPORTS ====================
+from flask import Flask, render_template_string, request, jsonify, redirect, session, flash
+import requests
+import psutil
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
@@ -129,7 +129,188 @@ def save_vm_data(user_id, vm_id, data):
 def get_vm_log_path(user_id, vm_id):
     return get_user_vm_dir(user_id, vm_id) / "logs.txt"
 
+# ==================== SYSTEM INFO HELPERS ====================
+def get_local_system_info():
+    """Lấy thông tin chi tiết hệ thống máy chính (Local Node)."""
+    info = {
+        "online": True,
+        "os": "Unknown",
+        "os_version": "",
+        "hostname": "localhost",
+        "cpu_cores": 0,
+        "cpu_threads": 0,
+        "cpu_percent": 0,
+        "ram_total_gb": 0,
+        "ram_used_gb": 0,
+        "ram_percent": 0,
+        "disk_total_gb": 0,
+        "disk_used_gb": 0,
+        "disk_percent": 0,
+        "uptime": "N/A"
+    }
+    try:
+        info["os"] = platform.system()
+        info["os_version"] = platform.release()
+        info["hostname"] = platform.node()
+    except Exception:
+        pass
+    try:
+        import psutil
+        info["cpu_cores"] = psutil.cpu_count(logical=False) or 0
+        info["cpu_threads"] = psutil.cpu_count(logical=True) or 0
+        info["cpu_percent"] = psutil.cpu_percent(interval=0.5)
+        mem = psutil.virtual_memory()
+        info["ram_total_gb"] = round(mem.total / (1024**3), 2)
+        info["ram_used_gb"] = round(mem.used / (1024**3), 2)
+        info["ram_free_gb"] = round((mem.total - mem.used) / (1024**3), 2)
+        info["ram_percent"] = mem.percent
+        disk = psutil.disk_usage("/")
+        info["disk_total_gb"] = round(disk.total / (1024**3), 2)
+        info["disk_used_gb"] = round(disk.used / (1024**3), 2)
+        info["disk_free_gb"] = round((disk.total - disk.used) / (1024**3), 2)
+        info["disk_percent"] = disk.percent
+        # Uptime
+        boot_time = psutil.boot_time()
+        uptime_seconds = time.time() - boot_time
+        hours = int(uptime_seconds // 3600)
+        minutes = int((uptime_seconds % 3600) // 60)
+        info["uptime"] = f"{hours}h {minutes}m"
+    except ImportError:
+        info["note"] = "psutil chưa được cài đặt"
+    except Exception:
+        pass
+    return info
+
 # ==================== NODE / WORKER HELPERS ====================
+
+def get_node_vm_count(node_id):
+    """Đếm số VM đang có trên một node cụ thể, trả về count + list user."""
+    count = 0
+    users_list = []
+    all_users = load_all_users()
+    for uid, user in all_users.items():
+        user_vms = get_user_vms(uid)
+        for vid, vm in user_vms.items():
+            if vm.get("node_id", "local") == node_id:
+                count += 1
+                uname = user.get("username", "Unknown")
+                if uname not in users_list:
+                    users_list.append(uname)
+    return count, users_list
+
+def check_node_capacity(node, config, node_id="local"):
+    """
+    Kiểm tra xem node có đủ tài nguyên để chứa VM với config không.
+    Trả về (ok: bool, error_msg: str, status: dict)
+    """
+    # Lấy thông tin real-time
+    if node_id == "local" or node.get("type") == "local":
+        status = get_local_system_info()
+    else:
+        status = get_node_status(node)
+
+    if not status.get("online") and not status.get("success"):
+        return False, "Node offline.", status
+
+    # Kiểm tra khóa thủ công / tự động
+    if node.get("locked", False):
+        return False, "Node đã khóa.", status
+
+    # Kiểm tra giới hạn số VM
+    max_vms = int(node.get("max_vms", 0) or 0)
+    if max_vms > 0:
+        current_count, _ = get_node_vm_count(node_id)
+        if current_count >= max_vms:
+            return False, "Node đã đầy.", status
+
+    # Kiểm tra tài nguyên: cần có psutil data
+    req_cpu = int(config.get("cpu", 1))
+    req_ram = int(config.get("ram", 1))  # GB
+    req_disk = int(config.get("disk", 15))  # GB
+
+    total_ram = float(status.get("ram_total_gb", 0))
+    used_ram = float(status.get("ram_used_gb", 0))
+    total_disk = float(status.get("disk_total_gb", 0))
+    used_disk = float(status.get("disk_used_gb", 0))
+    cpu_percent = float(status.get("cpu_percent", 0))
+
+    # Tính free (ước lượng an toàn)
+    free_ram = total_ram - used_ram
+    free_disk = total_disk - used_disk
+
+    # Ngưỡng cảnh báo
+    RAM_THRESHOLD = 90  # %
+    DISK_THRESHOLD = 90  # %
+    CPU_THRESHOLD = 95  # %
+
+    if cpu_percent >= CPU_THRESHOLD:
+        return False, "Không đủ CPU.", status
+    if status.get("ram_percent", 0) >= RAM_THRESHOLD:
+        return False, "Không đủ RAM.", status
+    if status.get("disk_percent", 0) >= DISK_THRESHOLD:
+        return False, "Không đủ Disk.", status
+
+    # Kiểm tra cấu hình VM có vượt quá tài nguyên còn trống không
+    if total_ram > 0 and free_ram < req_ram * 1.2:
+        return False, "Không đủ RAM.", status
+    if total_disk > 0 and free_disk < req_disk * 1.1:
+        return False, "Không đủ Disk.", status
+
+    return True, "", status
+
+def auto_lock_nodes_if_full():
+    """Tự động khóa node nếu tài nguyên đầy. Chạy định kỳ."""
+    nodes = get_nodes()
+    changed = False
+    for node_id, node in nodes.items():
+        if not node.get("auto_lock", True):
+            continue
+        if node_id == "local" or node.get("type") == "local":
+            status = get_local_system_info()
+        else:
+            status = get_node_status(node)
+
+        if not status.get("online") and not status.get("success"):
+            # Node offline -> tự động khóa nếu đang bật auto_lock
+            if not node.get("locked", False):
+                node["locked"] = True
+                node["lock_reason"] = "Tự động khóa: Node offline"
+                changed = True
+            continue
+
+        cpu = float(status.get("cpu_percent", 0))
+        ram_pct = float(status.get("ram_percent", 0))
+        disk_pct = float(status.get("disk_percent", 0))
+
+        # Nếu quá tải nghiêm trọng -> khóa
+        if cpu >= 95 or ram_pct >= 92 or disk_pct >= 92:
+            if not node.get("locked", False):
+                node["locked"] = True
+                reasons = []
+                if cpu >= 95: reasons.append(f"CPU {cpu}%")
+                if ram_pct >= 92: reasons.append(f"RAM {ram_pct}%")
+                if disk_pct >= 92: reasons.append(f"Disk {disk_pct}%")
+                node["lock_reason"] = "Tự động khóa: " + ", ".join(reasons)
+                changed = True
+        else:
+            # Nếu đã hết quá tải và đang bị khóa tự động -> mở khóa
+            if node.get("locked", False) and node.get("lock_reason", "").startswith("Tự động khóa"):
+                node["locked"] = False
+                node["lock_reason"] = ""
+                changed = True
+
+    if changed:
+        save_nodes(nodes)
+
+def node_auto_lock_worker():
+    while True:
+        try:
+            auto_lock_nodes_if_full()
+        except Exception as e:
+            print(f"[AUTO-LOCK ERROR] {e}")
+        time.sleep(30)
+
+
 def get_worker_token():
     token_file = DATA_DIR / "worker_token.json"
     if token_file.exists():
@@ -147,13 +328,29 @@ def get_nodes():
             "port": WORKER_PORT,
             "type": "local",
             "enabled": True,
-            "token": ""
+            "token": "",
+            "max_vms": 0,
+            "auto_lock": True,
+            "locked": False,
+            "lock_reason": ""
         }
     }
     nodes = load_json(NODES_FILE)
     for k, v in defaults.items():
         if k not in nodes:
             nodes[k] = v
+    # Đảm bảo mỗi node có đủ trường mới
+    for k, v in nodes.items():
+        if "max_vms" not in v:
+            v["max_vms"] = 0
+        if "auto_lock" not in v:
+            v["auto_lock"] = True
+        if "locked" not in v:
+            v["locked"] = False
+        if "lock_reason" not in v:
+            v["lock_reason"] = ""
+        if "hide_when_full" not in v:
+            v["hide_when_full"] = False
     return nodes
 
 def save_nodes(data):
@@ -190,7 +387,9 @@ def get_node_status(node):
             timeout=5
         )
         if r.status_code == 200:
-            return r.json()
+            data = r.json()
+            data["online"] = data.get("success", False) and data.get("online", False)
+            return data
     except Exception:
         pass
     return {"success": False, "online": False}
@@ -228,13 +427,13 @@ def save_settings(data):
 
 # ==================== CONFIGS & OS DATA ====================
 DEFAULT_VM_CONFIGS = {
-    "basic": {"name": "Basic", "cpu": 1, "ram": 1, "disk": 15, "price_minutely": 200, "price_hourly": 5000, "price_daily": 35000, "price_weekly": 200000, "price_monthly": 100000},
-    "standard": {"name": "Standard", "cpu": 2, "ram": 4, "disk": 60, "price_minutely": 500, "price_hourly": 15000, "price_daily": 100000, "price_weekly": 600000, "price_monthly": 300000},
-    "pro": {"name": "Pro", "cpu": 4, "ram": 8, "disk": 120, "price_minutely": 1000, "price_hourly": 30000, "price_daily": 200000, "price_weekly": 1200000, "price_monthly": 600000},
-    "enterprise": {"name": "Enterprise", "cpu": 8, "ram": 16, "disk": 250, "price_minutely": 2000, "price_hourly": 60000, "price_daily": 400000, "price_weekly": 2400000, "price_monthly": 1200000},
-    "ultra": {"name": "Ultra", "cpu": 16, "ram": 32, "disk": 500, "price_minutely": 4000, "price_hourly": 120000, "price_daily": 800000, "price_weekly": 4800000, "price_monthly": 2400000},
-    "super": {"name": "Super", "cpu": 32, "ram": 64, "disk": 1000, "price_minutely": 8000, "price_hourly": 240000, "price_daily": 1600000, "price_weekly": 9600000, "price_monthly": 4800000},
-    "mega": {"name": "Mega", "cpu": 64, "ram": 128, "disk": 2000, "price_minutely": 16000, "price_hourly": 480000, "price_daily": 3200000, "price_weekly": 19200000, "price_monthly": 9600000},
+    "basic": {"name": "Basic", "cpu": 1, "ram": 1, "disk": 15, "price_minutely": 200, "price_hourly": 5000, "price_daily": 35000, "price_weekly": 200000, "price_monthly": 100000, "disabled_cycles": []},
+    "standard": {"name": "Standard", "cpu": 2, "ram": 4, "disk": 60, "price_minutely": 500, "price_hourly": 15000, "price_daily": 100000, "price_weekly": 600000, "price_monthly": 300000, "disabled_cycles": []},
+    "pro": {"name": "Pro", "cpu": 4, "ram": 8, "disk": 120, "price_minutely": 1000, "price_hourly": 30000, "price_daily": 200000, "price_weekly": 1200000, "price_monthly": 600000, "disabled_cycles": []},
+    "enterprise": {"name": "Enterprise", "cpu": 8, "ram": 16, "disk": 250, "price_minutely": 2000, "price_hourly": 60000, "price_daily": 400000, "price_weekly": 2400000, "price_monthly": 1200000, "disabled_cycles": []},
+    "ultra": {"name": "Ultra", "cpu": 16, "ram": 32, "disk": 500, "price_minutely": 4000, "price_hourly": 120000, "price_daily": 800000, "price_weekly": 4800000, "price_monthly": 2400000, "disabled_cycles": []},
+    "super": {"name": "Super", "cpu": 32, "ram": 64, "disk": 1000, "price_minutely": 8000, "price_hourly": 240000, "price_daily": 1600000, "price_weekly": 9600000, "price_monthly": 4800000, "disabled_cycles": []},
+    "mega": {"name": "Mega", "cpu": 64, "ram": 128, "disk": 2000, "price_minutely": 16000, "price_hourly": 480000, "price_daily": 3200000, "price_weekly": 19200000, "price_monthly": 9600000, "disabled_cycles": []},
 }
 
 DEFAULT_WINDOWS_IMAGES = {
@@ -257,11 +456,13 @@ def get_vm_configs():
     if not configs:
         configs = DEFAULT_VM_CONFIGS
         save_json(CONFIGS_FILE, configs)
-    # backward compat: đảm bảo mỗi config có đủ 5 giá
+    # backward compat: đảm bảo mỗi config có đủ 5 giá và disabled_cycles
     for k, cfg in configs.items():
         for price_key in ("price_minutely", "price_hourly", "price_daily", "price_weekly", "price_monthly"):
             if price_key not in cfg:
                 cfg[price_key] = 0
+        if "disabled_cycles" not in cfg:
+            cfg["disabled_cycles"] = []
     return configs
 
 def get_windows_images():
@@ -503,6 +704,27 @@ def _stop_vm_logged(user_id, vm_id, vm_dir):
         append_vm_log(user_id, vm_id, "[STOP] QEMU đã tắt thành công sau pkill.")
 
     with vm_lock:
+        if vm_id in active_vms and active_vms[vm_id].get("tailscale_process"):
+            try:
+                active_vms[vm_id]["tailscale_process"].terminate()
+                active_vms[vm_id]["tailscale_process"].wait(timeout=3)
+            except Exception:
+                try:
+                    active_vms[vm_id]["tailscale_process"].kill()
+                except Exception:
+                    pass
+            active_vms[vm_id]["tailscale_process"] = None
+
+        if vm_id in active_vms and active_vms[vm_id].get("rdp_process"):
+            try:
+                active_vms[vm_id]["rdp_process"].terminate()
+                active_vms[vm_id]["rdp_process"].wait(timeout=3)
+            except Exception:
+                try:
+                    active_vms[vm_id]["rdp_process"].kill()
+                except Exception:
+                    pass
+            active_vms[vm_id]["rdp_process"] = None
         if vm_id in active_vms and active_vms[vm_id].get("process"):
             try:
                 active_vms[vm_id]["process"].terminate()
@@ -590,9 +812,13 @@ def _delete_vm_logged(user_id, vm_id, vm_dir, windows_key="win11"):
     append_vm_log(user_id, vm_id, "==========================================================")
 
 def _tailscale_worker(user_id, vm_id, tailscale_key, vm_dir):
-    """Chạy tailscale trong thread riêng, parse IP và cập nhật ngay lập tức."""
+    """Cài/chạy Tailscale SAU KHI QEMU đã sẵn sàng."""
     if not tailscale_key:
         append_vm_log(user_id, vm_id, "[TAILSCALE] Không có Auth Key, bỏ qua.")
+        return
+    vm_data = get_vm_data(user_id, vm_id)
+    if vm_data and vm_data.get("rdp_mode", "tailscale") != "tailscale":
+        append_vm_log(user_id, vm_id, "[TAILSCALE] VM đang dùng Pinggy -> KHÔNG cài Tailscale.")
         return
     ts_script = vm_dir / "install_tailscale.sh"
     with open(ts_script, "w", encoding="utf-8") as f:
@@ -609,6 +835,9 @@ def _tailscale_worker(user_id, vm_id, tailscale_key, vm_dir):
             text=True,
             cwd=str(vm_dir)
         )
+        with vm_lock:
+            if vm_id in active_vms:
+                active_vms[vm_id]["tailscale_process"] = ts_process
         for line in ts_process.stdout:
             line_str = line.strip()
             append_vm_log(user_id, vm_id, f"[TAILSCALE] {line_str}")
@@ -624,23 +853,152 @@ def _tailscale_worker(user_id, vm_id, tailscale_key, vm_dir):
                     save_vm_data(user_id, vm_id, vm_data)
                     append_vm_log(user_id, vm_id, f"[TAILSCALE] IP đã cập nhật: {ts_ip}")
         ts_process.wait()
-        append_vm_log(user_id, vm_id, "[TAILSCALE] Tiến trình Tailscale đã kết thúc.")
+        if ts_process.returncode == 0:
+            vm_d = get_vm_data(user_id, vm_id)
+            if vm_d and vm_d.get("tailscale_ip"):
+                append_vm_log(user_id, vm_id, "[TAILSCALE] Tailscale READY.")
+                mark_vm_connection_ready(user_id, vm_id)
+            else:
+                append_vm_log(user_id, vm_id, "[TAILSCALE] Cài xong nhưng chưa lấy được IP -> VM chưa READY.")
+                vm_d = get_vm_data(user_id, vm_id)
+                if vm_d:
+                    vm_d["status"] = "stopped"
+                    save_vm_data(user_id, vm_id, vm_d)
+        else:
+            append_vm_log(user_id, vm_id, f"[TAILSCALE] Tailscale thất bại, exit={ts_process.returncode}.")
+            vm_d = get_vm_data(user_id, vm_id)
+            if vm_d:
+                vm_d["status"] = "stopped"
+                save_vm_data(user_id, vm_id, vm_d)
     except Exception as e:
         append_vm_log(user_id, vm_id, f"[TAILSCALE] Lỗi cài đặt Tailscale: {e}")
 
 
-def start_vm_existing(user_id, vm_id, config, vm_dir, vm_name, windows_key, tailscale_key):
+def _rdp_tunnel_worker(user_id, vm_id, vm_dir):
+    """Chạy Pinggy SAU KHI QEMU đã sẵn sàng. Không chạy cùng Tailscale."""
+    while True:
+        vm_data = get_vm_data(user_id, vm_id)
+        if not vm_data or vm_data.get("status") not in ("running", "creating"):
+            append_vm_log(user_id, vm_id, "[PINGGY] VM không còn hoạt động. Dừng tunnel worker.")
+            break
+
+        if vm_data.get("rdp_mode") != "rdp1h":
+            append_vm_log(user_id, vm_id, "[PINGGY] VM không chọn Pinggy -> không khởi động tunnel.")
+            break
+
+        if not vm_data.get("rdp_tunnel_enabled"):
+            append_vm_log(user_id, vm_id, "[PINGGY] Pinggy đã bị tắt. Dừng worker.")
+            break
+
+        append_vm_log(user_id, vm_id, "==========================================================")
+        append_vm_log(user_id, vm_id, "[PINGGY] QEMU đã sẵn sàng -> khởi động SSH tunnel RDP...")
+        append_vm_log(user_id, vm_id, "[PINGGY] ssh -p 443 -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -R0:127.0.0.1:3389 tcp@free.pinggy.io")
+        append_vm_log(user_id, vm_id, "==========================================================")
+
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                [
+                    "ssh",
+                    "-p", "443",
+                    "-o", "StrictHostKeyChecking=no",
+                    "-o", "ServerAliveInterval=30",
+                    "-R", "0:127.0.0.1:3389",
+                    "tcp@free.pinggy.io"
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                cwd=str(vm_dir),
+                bufsize=1
+            )
+
+            with vm_lock:
+                if vm_id in active_vms:
+                    active_vms[vm_id]["rdp_process"] = proc
+
+            found = False
+            for line in proc.stdout:
+                line_str = line.strip()
+                if line_str:
+                    append_vm_log(user_id, vm_id, f"[PINGGY] {line_str}")
+
+                # === LỌC BOX-DRAWING + KHOẢNG TRẮNG ===
+                cleaned = re.sub(r'[│┌┐└┘─\s]+', ' ', line_str).strip()
+
+                # === TÌM tcp:// VÀ LẤY ENDPOINT ===
+                tcp_match = re.search(r'tcp://(\S+)', cleaned)
+                if tcp_match and not found:
+                    endpoint_clean = tcp_match.group(1)
+                    # Làm sạch ký tự không in được nếu có
+                    endpoint_clean = re.sub(r'[^\x20-\x7E]+', '', endpoint_clean).strip()
+
+                    if endpoint_clean:
+                        found = True
+                        host = endpoint_clean
+                        port = 0
+                        if ':' in endpoint_clean:
+                            host_part, port_part = endpoint_clean.rsplit(':', 1)
+                            if port_part.isdigit():
+                                host = host_part
+                                port = int(port_part)
+
+                        vm_d = get_vm_data(user_id, vm_id)
+                        if vm_d:
+                            vm_d["rdp_tunnel_url"] = endpoint_clean
+                            vm_d["rdp_tunnel_host"] = host
+                            vm_d["rdp_tunnel_port"] = port
+                            save_vm_data(user_id, vm_id, vm_d)
+
+                        with vm_lock:
+                            if vm_id in active_vms:
+                                active_vms[vm_id]["rdp_tunnel_url"] = endpoint_clean
+                                active_vms[vm_id]["rdp_tunnel_host"] = host
+                                active_vms[vm_id]["rdp_tunnel_port"] = port
+
+                        append_vm_log(user_id, vm_id, f"[PINGGY] RDP endpoint: {endpoint_clean}")
+                        append_vm_log(user_id, vm_id, f"[PINGGY] Dùng địa chỉ này để RDP: {endpoint_clean}")
+                        mark_vm_connection_ready(user_id, vm_id)
+
+                if proc.poll() is not None:
+                    break
+
+            proc.wait()
+            append_vm_log(user_id, vm_id, "[PINGGY] SSH tunnel đã kết thúc.")
+
+        except Exception as e:
+            append_vm_log(user_id, vm_id, f"[PINGGY] Lỗi: {e}")
+        finally:
+            with vm_lock:
+                if vm_id in active_vms and active_vms[vm_id].get("rdp_process") is proc:
+                    active_vms[vm_id]["rdp_process"] = None
+
+        vm_data = get_vm_data(user_id, vm_id)
+        if not vm_data or vm_data.get("status") != "running":
+            break
+        if not vm_data.get("rdp_tunnel_auto", True):
+            append_vm_log(user_id, vm_id, "[PINGGY] Auto refresh đã tắt. Dừng.")
+            break
+
+        append_vm_log(user_id, vm_id, "[PINGGY] Tunnel kết thúc -> đợi 3 giây rồi tạo tunnel mới...")
+        time.sleep(3)
+
+
+def start_vm_existing(user_id, vm_id, config, vm_dir, vm_name, windows_key, tailscale_key, rdp_mode="tailscale"):
     """
-    Khởi động lại VM bằng cách tải lại script win.sh và chạy lại.
-    Giống như tạo VM mới, nhưng KHÔNG resize disk.
+    Khởi động lại VM.
+    Thứ tự bắt buộc:
+      1. QEMU chạy và được xác nhận còn sống.
+      2. Chỉ sau đó mới chạy Tailscale HOẶC Pinggy.
     """
     append_vm_log(user_id, vm_id, "==========================================================")
     append_vm_log(user_id, vm_id, "[START] BẮT ĐẦU KHỞI ĐỘNG LẠI VM")
+    append_vm_log(user_id, vm_id, f"[START] Chế độ RDP: {rdp_mode}")
     append_vm_log(user_id, vm_id, "==========================================================")
-    append_vm_log(user_id, vm_id, "[START] STEP 1: TẢI LẠI WINBOX SCRIPT")
 
     script_url = "https://raw.githubusercontent.com/thanhtrung-devVNG/demo_web/refs/heads/main/winbox.sh"
     script_path = vm_dir / "win.sh"
+
     try:
         download_proc = subprocess.run(
             ["wget", "-O", str(script_path), script_url],
@@ -651,23 +1009,12 @@ def start_vm_existing(user_id, vm_id, config, vm_dir, vm_name, windows_key, tail
                 ["curl", "-fsSL", "-o", str(script_path), script_url],
                 capture_output=True, text=True, timeout=120
             )
-        if script_path.exists() and script_path.stat().st_size > 1000:
-            os.chmod(script_path, 0o755)
-            append_vm_log(user_id, vm_id, f"[START] Đã tải lại win.sh ({script_path.stat().st_size} bytes)")
-        else:
-            append_vm_log(user_id, vm_id, "[START] CẢNH BÁO: Không tải được win.sh, thử dùng script cũ...")
-            old_script = vm_dir / "win.sh"
-            if not old_script.exists():
-                old_script = vm_dir / "win.sh"
-            if old_script.exists():
-                script_path = old_script
-            else:
-                return False, "Không tìm thấy script nào để khởi động lại VM."
+        if not script_path.exists() or script_path.stat().st_size <= 1000:
+            return False, "Không tải được win.sh để khởi động VM."
+        os.chmod(script_path, 0o755)
     except Exception as e:
-        append_vm_log(user_id, vm_id, f"[START] Lỗi tải script: {e}")
         return False, f"Lỗi tải script: {e}"
 
-    append_vm_log(user_id, vm_id, "[START] STEP 2: CHUẨN BỊ THAM SỐ TỰ ĐỘNG CHO SCRIPT")
     WIN_FLAG_MAP = {
         "win2012": "--win2012",
         "win2022": "--win2022",
@@ -678,11 +1025,11 @@ def start_vm_existing(user_id, vm_id, config, vm_dir, vm_name, windows_key, tail
     }
     win_flag = WIN_FLAG_MAP.get(windows_key, "--win11")
     wrapper_script = vm_dir / "run_vm.sh"
-    cmd_args = ["bash", str(script_path), "--auto", win_flag, "--vnc"]
+
     wrapper_lines = [
         "#!/bin/bash",
         f'cd "{vm_dir}"',
-        " ".join(cmd_args),
+        f'bash "{script_path}" --auto {win_flag} --vnc',
         ""
     ]
     with open(wrapper_script, "w", encoding="utf-8") as f:
@@ -698,11 +1045,6 @@ def start_vm_existing(user_id, vm_id, config, vm_dir, vm_name, windows_key, tail
     env["USER"] = "winbox"
     env["LOGNAME"] = "winbox"
 
-    append_vm_log(user_id, vm_id, f"[START] Cấu hình: {config.get('name', 'Custom')} ({config.get('cpu', 2)} vCPU, {config.get('ram', 4)} GB RAM, {config.get('disk', 15)} GB Disk)")
-    append_vm_log(user_id, vm_id, f"[START] Hệ điều hành: {windows_key} ({win_flag})")
-    append_vm_log(user_id, vm_id, "[START] KHÔNG resize disk - giữ nguyên dung lượng hiện tại")
-    append_vm_log(user_id, vm_id, "----------------------------------------------------------")
-
     try:
         process = subprocess.Popen(
             ["bash", str(wrapper_script)],
@@ -710,15 +1052,19 @@ def start_vm_existing(user_id, vm_id, config, vm_dir, vm_name, windows_key, tail
             stderr=subprocess.STDOUT,
             text=True,
             cwd=str(vm_dir),
-            env=env
+            env=env,
+            bufsize=1
         )
         with vm_lock:
             old_data = active_vms.get(vm_id, {})
             active_vms[vm_id] = {
                 "process": process,
-                "status": "running",
+                "status": "creating",
                 "tailscale_ip": old_data.get("tailscale_ip"),
-                "tailscale_key": tailscale_key or old_data.get("tailscale_key"),
+                "tailscale_key": tailscale_key if rdp_mode == "tailscale" else "",
+                "tailscale_process": None,
+                "rdp_process": None,
+                "rdp_mode": rdp_mode,
                 "config": config,
                 "windows": old_data.get("windows"),
                 "name": vm_name,
@@ -726,36 +1072,87 @@ def start_vm_existing(user_id, vm_id, config, vm_dir, vm_name, windows_key, tail
                 "vm_dir": str(vm_dir),
             }
 
+        def _log_worker():
+            try:
+                for line in process.stdout:
+                    line_str = line.strip()
+                    if line_str:
+                        append_vm_log(user_id, vm_id, line_str)
+            finally:
+                process.wait()
+                append_vm_log(user_id, vm_id, "[START] Tiến trình QEMU đã kết thúc.")
+
+        threading.Thread(target=_log_worker, daemon=True).start()
+
+        # Xác nhận QEMU đã thực sự chạy trước khi làm bất kỳ tunnel/RDP setup nào.
+        ready = False
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if process.poll() is not None:
+                break
+            if _check_qemu_running(vm_dir):
+                ready = True
+                break
+            time.sleep(1)
+
+        if not ready:
+            append_vm_log(user_id, vm_id, "[START] QEMU chưa sẵn sàng hoặc đã thoát.")
+            with vm_lock:
+                if vm_id in active_vms:
+                    active_vms[vm_id]["status"] = "stopped"
+            return False, "QEMU không khởi động thành công."
+
+        time.sleep(2)
+        if process.poll() is not None:
+            return False, "QEMU đã thoát ngay sau khi khởi động."
+
+        with vm_lock:
+            if vm_id in active_vms:
+                active_vms[vm_id]["status"] = "creating"
+                active_vms[vm_id]["rdp_mode"] = rdp_mode
+
         vm_data = get_vm_data(user_id, vm_id)
         if vm_data:
-            vm_data["status"] = "running"
+            vm_data["status"] = "creating"
+            vm_data["rdp_mode"] = rdp_mode
+            vm_data["tailscale_key"] = tailscale_key if rdp_mode == "tailscale" else ""
+            vm_data["rdp_tunnel_enabled"] = (rdp_mode == "rdp1h")
             save_vm_data(user_id, vm_id, vm_data)
 
-        # Chạy tailscale song song ngay lập tức
-        ts_thread = threading.Thread(
-            target=_tailscale_worker,
-            args=(user_id, vm_id, tailscale_key or old_data.get("tailscale_key"), vm_dir),
-            daemon=True
-        )
-        ts_thread.start()
+        append_vm_log(user_id, vm_id, "[START] QEMU READY -> đang chờ kết nối RDP READY.")
 
-        def _log_worker():
-            for line in process.stdout:
-                line_str = line.strip()
-                append_vm_log(user_id, vm_id, line_str)
-            process.wait()
-            append_vm_log(user_id, vm_id, "[START] Tiến trình QEMU đã kết thúc.")
+        if rdp_mode == "tailscale":
+            append_vm_log(user_id, vm_id, "[START] QEMU READY -> bắt đầu Tailscale.")
+            threading.Thread(
+                target=_tailscale_worker,
+                args=(user_id, vm_id, tailscale_key, vm_dir),
+                daemon=True
+            ).start()
+        elif rdp_mode == "rdp1h":
+            append_vm_log(user_id, vm_id, "[START] QEMU READY -> bắt đầu Pinggy.")
+            threading.Thread(
+                target=_rdp_tunnel_worker,
+                args=(user_id, vm_id, vm_dir),
+                daemon=True
+            ).start()
+        else:
+            append_vm_log(user_id, vm_id, f"[START] Chế độ RDP không xác định: {rdp_mode}. Không chạy tunnel.")
 
-        t = threading.Thread(target=_log_worker, daemon=True)
-        t.start()
-
-        return True, "VM đã được khởi động lại bằng win.sh (KHÔNG resize disk)"
+        return True, "VM đã khởi động lại thành công."
     except Exception as e:
+        append_vm_log(user_id, vm_id, f"[START] Lỗi khởi động VM: {e}")
         return False, f"Lỗi khởi động lại VM: {e}"
 
-
 # ==================== VM RUNNER ====================
-def run_winbox_script(user_id, vm_id, config, win_img, tailscale_key, vm_name, windows_key="win11"):
+def run_winbox_script(user_id, vm_id, config, win_img, tailscale_key, vm_name, windows_key="win11", rdp_mode="tailscale"):
+    """
+    Tạo VM theo đúng thứ tự:
+      1. Tải/chuẩn bị winbox.sh.
+      2. Chạy QEMU.
+      3. Chờ xác nhận QEMU còn sống.
+      4. Chỉ sau đó mới chạy Tailscale HOẶC Pinggy.
+      5. Chỉ sau khi QEMU READY mới bắt đầu countdown thuê.
+    """
     if isinstance(config, str):
         configs = get_vm_configs()
         config = configs.get(config, list(configs.values())[0])
@@ -763,26 +1160,49 @@ def run_winbox_script(user_id, vm_id, config, win_img, tailscale_key, vm_name, w
         images = get_windows_images()
         windows_key = win_img
         win_img = images.get(win_img, list(images.values())[0])
+
+    rdp_mode = rdp_mode if rdp_mode in ("tailscale", "rdp1h") else "tailscale"
+    if rdp_mode == "tailscale" and not tailscale_key:
+        append_vm_log(user_id, vm_id, "[CREATE] Không có Tailscale Auth Key.")
+        vm_data = get_vm_data(user_id, vm_id)
+        if vm_data:
+            vm_data["status"] = "stopped"
+            save_vm_data(user_id, vm_id, vm_data)
+        return
+
+    if rdp_mode == "rdp1h":
+        tailscale_key = ""
+
     vm_dir = get_user_vm_dir(user_id, vm_id)
     with vm_lock:
         active_vms[vm_id] = {
             "process": None,
             "status": "creating",
             "tailscale_ip": None,
-            "tailscale_key": tailscale_key,
+            "tailscale_key": tailscale_key if rdp_mode == "tailscale" else "",
+            "tailscale_process": None,
+            "rdp_process": None,
+            "rdp_mode": rdp_mode,
+            "rdp_tunnel_url": None,
             "config": config,
             "windows": win_img,
             "name": vm_name,
             "created_at": datetime.now().isoformat(),
             "vm_dir": str(vm_dir),
         }
-    def log_append(text):
-        append_vm_log(user_id, vm_id, text)
+
+    def log_append(msg):
+        append_vm_log(user_id, vm_id, msg)
+
     log_append("==========================================================")
-    log_append("STEP 1: TẢI WINBOXES STABLE SCRIPT")
+    log_append("[CREATE] BẮT ĐẦU TẠO VM")
+    log_append(f"[CREATE] Chế độ kết nối: {'Tailscale' if rdp_mode == 'tailscale' else 'Pinggy'}")
+    log_append("[CREATE] STEP 1: TẢI WINBOX SCRIPT")
     log_append("==========================================================")
+
     script_url = "https://raw.githubusercontent.com/thanhtrung-devVNG/demo_web/refs/heads/main/winbox.sh"
     script_path = vm_dir / "win.sh"
+
     try:
         download_proc = subprocess.run(
             ["wget", "-O", str(script_path), script_url],
@@ -793,18 +1213,23 @@ def run_winbox_script(user_id, vm_id, config, win_img, tailscale_key, vm_name, w
                 ["curl", "-fsSL", "-o", str(script_path), script_url],
                 capture_output=True, text=True, timeout=120
             )
-        if script_path.exists() and script_path.stat().st_size > 1000:
-            os.chmod(script_path, 0o755)
-            log_append(f"Đã tải winboxes-stable-3-2.sh ({script_path.stat().st_size} bytes)")
-        else:
-            log_append("Không tải được script winboxes-stable-3-2.sh")
+        if not script_path.exists() or script_path.stat().st_size <= 1000:
+            log_append("[CREATE] Không tải được winbox.sh.")
+            vm_data = get_vm_data(user_id, vm_id)
+            if vm_data:
+                vm_data["status"] = "stopped"
+                save_vm_data(user_id, vm_id, vm_data)
             return
+        os.chmod(script_path, 0o755)
+        log_append(f"[CREATE] Đã tải win.sh ({script_path.stat().st_size} bytes)")
     except Exception as e:
-        log_append(f"Lỗi tải script: {e}")
+        log_append(f"[CREATE] Lỗi tải script: {e}")
+        vm_data = get_vm_data(user_id, vm_id)
+        if vm_data:
+            vm_data["status"] = "stopped"
+            save_vm_data(user_id, vm_id, vm_data)
         return
-    log_append("==========================================================")
-    log_append("STEP 2: CHUẨN BỊ THAM SỐ TỰ ĐỘNG CHO SCRIPT")
-    log_append("==========================================================")
+
     WIN_FLAG_MAP = {
         "win2012": "--win2012",
         "win2022": "--win2022",
@@ -815,45 +1240,46 @@ def run_winbox_script(user_id, vm_id, config, win_img, tailscale_key, vm_name, w
     }
     win_flag = WIN_FLAG_MAP.get(windows_key, "--win11")
     wrapper_script = vm_dir / "run_vm.sh"
-    cmd_args = ["bash", str(script_path), "--auto", win_flag, "--vnc"]
     wrapper_lines = [
         "#!/bin/bash",
         f'cd "{vm_dir}"',
-        " ".join(cmd_args),
+        f'bash "{script_path}" --auto {win_flag} --vnc',
         ""
     ]
     with open(wrapper_script, "w", encoding="utf-8") as f:
         f.write("\n".join(wrapper_lines))
     os.chmod(wrapper_script, 0o755)
+
     env = os.environ.copy()
-    env["WINBOX_VCPUS"] = str(config["cpu"])
-    env["WINBOX_RAM_GB"] = str(config["ram"])
-    env["WINBOX_DISK_GB"] = str(config["disk"])
+    env["WINBOX_VCPUS"] = str(config.get("cpu", 2))
+    env["WINBOX_RAM_GB"] = str(config.get("ram", 4))
+    env["WINBOX_DISK_GB"] = str(config.get("disk", 15))
     env["WINBOX_VNC"] = "1"
     env["HOME"] = str(vm_dir)
     env["USER"] = "winbox"
     env["LOGNAME"] = "winbox"
+
     target_disk_gb = int(config.get("disk", 15))
-    log_append(f"Gói VPS được chọn: {config.get('name', 'Custom')} ({config['cpu']} vCPU, {config['ram']} GB RAM, {config['disk']} GB Disk)")
-    log_append(f"Hệ điều hành được chọn: {win_img.get('name', 'Custom OS')} ({win_flag})")
-    log_append(f"Tham số gửi sang script: {' '.join(cmd_args)}")
-    log_append("----------------------------------------------------------")
+    log_append(f"[CREATE] Gói: {config.get('name', 'Custom')} - {config.get('cpu', 2)} vCPU / {config.get('ram', 4)} GB / {config.get('disk', 15)} GB")
+    log_append(f"[CREATE] OS: {win_img.get('name', 'Custom OS')} ({win_flag})")
+    log_append("[CREATE] STEP 2: KHỞI ĐỘNG QEMU")
+    log_append("[CREATE] Tailscale/Pinggy CHƯA được khởi động ở bước này.")
+
     def _disk_resize_worker():
         win_img_path = vm_dir / "win.img"
         max_wait = 600
         waited = 0
-        resized = False
-        while waited < max_wait and not resized:
+        while waited < max_wait:
             if win_img_path.exists():
                 try:
                     size = win_img_path.stat().st_size
                     if size > 1_000_000_000:
-                        log_append(f"[RESIZE] Phát hiện win.img ({size / 1_073_741_824:.1f} GB), đang resize đến {target_disk_gb}GB...")
+                        log_append(f"[RESIZE] Phát hiện win.img ({size / 1_073_741_824:.1f} GB), resize đến {target_disk_gb}GB...")
                         qemu_img = shutil.which("qemu-img")
                         if not qemu_img:
-                            for p in (vm_dir / "qemu-static" / "bin").glob("qemu-img"):
-                                if p.exists():
-                                    qemu_img = str(p)
+                            for q in (vm_dir / "qemu-static" / "bin").glob("qemu-img"):
+                                if q.exists():
+                                    qemu_img = str(q)
                                     break
                         if qemu_img:
                             r = subprocess.run(
@@ -863,50 +1289,116 @@ def run_winbox_script(user_id, vm_id, config, win_img, tailscale_key, vm_name, w
                             if r.returncode == 0:
                                 log_append(f"[RESIZE] Resize disk thành công đến {target_disk_gb}GB")
                             else:
-                                log_append(f"[RESIZE] qemu-img resize exit code {r.returncode}: {r.stderr or r.stdout}")
+                                log_append(f"[RESIZE] qemu-img resize lỗi {r.returncode}: {r.stderr or r.stdout}")
                         else:
-                            log_append("[RESIZE] Không tìm thấy qemu-img để resize")
-                        resized = True
-                        break
+                            log_append("[RESIZE] Không tìm thấy qemu-img.")
+                        return
                 except Exception as e:
-                    log_append(f"[RESIZE] Lỗi kiểm tra file: {e}")
+                    log_append(f"[RESIZE] Lỗi: {e}")
             time.sleep(3)
             waited += 3
-        if not resized:
-            log_append(f"[RESIZE] Hết thờigian chờ ({max_wait}s), không resize được disk")
-    resize_thread = threading.Thread(target=_disk_resize_worker, daemon=True)
-    resize_thread.start()
-    process = subprocess.Popen(
-        ["bash", str(wrapper_script)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        cwd=str(vm_dir),
-        env=env
-    )
-    with vm_lock:
-        if vm_id in active_vms:
-            active_vms[vm_id]["process"] = process
-            active_vms[vm_id]["status"] = "running"
-    vm_data = get_vm_data(user_id, vm_id)
-    if vm_data:
-        vm_data["status"] = "running"
-        save_vm_data(user_id, vm_id, vm_data)
-    # Chạy tailscale song song ngay lập tức (không chờ QEMU kết thúc)
-    ts_thread = threading.Thread(
-        target=_tailscale_worker,
-        args=(user_id, vm_id, tailscale_key, vm_dir),
-        daemon=True
-    )
-    ts_thread.start()
+        log_append("[RESIZE] Hết thời gian chờ resize disk.")
 
-    # Thread chính đọc log QEMU
-    for line in process.stdout:
-        line_str = line.strip()
-        log_append(line_str)
-    process.wait()
-    log_append("==========================================================")
-    log_append("[SYSTEM] QEMU process đã kết thúc.")
+    threading.Thread(target=_disk_resize_worker, daemon=True).start()
+
+    try:
+        process = subprocess.Popen(
+            ["bash", str(wrapper_script)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            cwd=str(vm_dir),
+            env=env,
+            bufsize=1
+        )
+
+        with vm_lock:
+            if vm_id in active_vms:
+                active_vms[vm_id]["process"] = process
+                active_vms[vm_id]["status"] = "creating"
+
+        def _qemu_log_worker():
+            try:
+                for line in process.stdout:
+                    line_str = line.strip()
+                    if line_str:
+                        log_append(line_str)
+            finally:
+                process.wait()
+                log_append("[SYSTEM] QEMU process đã kết thúc.")
+
+        threading.Thread(target=_qemu_log_worker, daemon=True).start()
+
+        # Chờ QEMU thực sự sống. Không chạy Tailscale/Pinggy trước mốc này.
+        ready = False
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            if process.poll() is not None:
+                break
+            if _check_qemu_running(vm_dir):
+                ready = True
+                break
+            time.sleep(1)
+
+        if not ready:
+            log_append("[CREATE] ❌ QEMU không đạt trạng thái READY.")
+            with vm_lock:
+                if vm_id in active_vms:
+                    active_vms[vm_id]["status"] = "stopped"
+            vm_data = get_vm_data(user_id, vm_id)
+            if vm_data:
+                vm_data["status"] = "stopped"
+                save_vm_data(user_id, vm_id, vm_data)
+            return
+
+        # Cho QEMU ổn định thêm một chút trước khi tạo tunnel.
+        time.sleep(2)
+        if process.poll() is not None:
+            log_append("[CREATE] ❌ QEMU đã thoát trước khi kết thúc bước READY.")
+            return
+
+        with vm_lock:
+            if vm_id in active_vms:
+                active_vms[vm_id]["status"] = "creating"
+                active_vms[vm_id]["rdp_mode"] = rdp_mode
+
+        vm_data = get_vm_data(user_id, vm_id)
+        if vm_data:
+            vm_data["status"] = "creating"
+            vm_data["rdp_mode"] = rdp_mode
+            vm_data["tailscale_key"] = tailscale_key if rdp_mode == "tailscale" else ""
+            vm_data["rdp_tunnel_enabled"] = (rdp_mode == "rdp1h")
+            vm_data["rdp_tunnel_auto"] = True
+            save_vm_data(user_id, vm_id, vm_data)
+
+        log_append("[CREATE] ✅ QEMU READY.")
+        log_append("[CREATE] Đang chờ Tailscale/Pinggy READY. Chưa bắt đầu tính giờ thuê.")
+
+        if rdp_mode == "tailscale":
+            log_append("[CREATE] STEP 3: QEMU READY -> CÀI TAILSCALE.")
+            threading.Thread(
+                target=_tailscale_worker,
+                args=(user_id, vm_id, tailscale_key, vm_dir),
+                daemon=True
+            ).start()
+        elif rdp_mode == "rdp1h":
+            log_append("[CREATE] STEP 3: QEMU READY -> CHẠY PINGGY.")
+            threading.Thread(
+                target=_rdp_tunnel_worker,
+                args=(user_id, vm_id, vm_dir),
+                daemon=True
+            ).start()
+
+        log_append("[CREATE] Hoàn tất chuỗi khởi tạo VM. VM đang chạy.")
+    except Exception as e:
+        log_append(f"[CREATE] Lỗi chạy QEMU: {e}")
+        vm_data = get_vm_data(user_id, vm_id)
+        if vm_data:
+            vm_data["status"] = "stopped"
+            save_vm_data(user_id, vm_id, vm_data)
+        with vm_lock:
+            if vm_id in active_vms:
+                active_vms[vm_id]["status"] = "stopped"
 
 # ==================== BILLING HELPERS ====================
 def get_price_for_cycle(config, cycle):
@@ -919,8 +1411,8 @@ def get_price_for_cycle(config, cycle):
     }
     return config.get(mapping.get(cycle, "price_monthly"), 0)
 
-def calculate_expiry(cycle, duration=1):
-    now = datetime.now()
+def calculate_expiry(cycle, duration=1, base_time=None):
+    now = base_time if base_time else datetime.now()
     dur = max(1, int(duration))
     if cycle == "minutely":
         return now + timedelta(minutes=dur)
@@ -932,6 +1424,45 @@ def calculate_expiry(cycle, duration=1):
         return now + timedelta(weeks=dur)
     else:  # monthly
         return now + timedelta(days=30*dur)
+
+def set_vm_expiry_if_needed(user_id, vm_id):
+    """Tính expiry_time khi VM chuyển sang running lần đầu."""
+    vm_data = get_vm_data(user_id, vm_id)
+    if not vm_data:
+        return
+    if vm_data.get("expiry_time"):
+        return
+    billing_cycle = vm_data.get("billing_cycle", "monthly")
+    duration = vm_data.get("duration", 1)
+    expiry = calculate_expiry(billing_cycle, duration).isoformat()
+    vm_data["expiry_time"] = expiry
+    save_vm_data(user_id, vm_id, vm_data)
+    append_vm_log(user_id, vm_id, f"[BILLING] VM bắt đầu tính giờ thuê ({duration} x {billing_cycle}). Hết hạn: {expiry[:16]}")
+
+def mark_vm_connection_ready(user_id, vm_id):
+    """
+    Chỉ gọi sau khi:
+      - QEMU đã READY
+      - và Tailscale đã lấy được IP hoặc Pinggy đã lấy được endpoint.
+    Từ đây VM mới chuyển sang running và bắt đầu countdown thuê.
+    """
+    vm_data = get_vm_data(user_id, vm_id)
+    if not vm_data:
+        return False
+
+    vm_data["status"] = "running"
+    vm_data["ready_at"] = datetime.now().isoformat()
+    vm_data["stopped_reason"] = ""
+    save_vm_data(user_id, vm_id, vm_data)
+
+    with vm_lock:
+        if vm_id in active_vms:
+            active_vms[vm_id]["status"] = "running"
+            active_vms[vm_id]["ready_at"] = vm_data["ready_at"]
+
+    set_vm_expiry_if_needed(user_id, vm_id)
+    append_vm_log(user_id, vm_id, "[BILLING] QEMU + kết nối RDP đã READY -> bắt đầu tính giờ thuê.")
+    return True
 
 # ==================== MARKETPLACE CLEANUP ====================
 def cleanup_marketplace():
@@ -1001,44 +1532,49 @@ def marketplace_cleanup_worker():
 # ==================== EXPIRED VM AUTO-CLEANUP ====================
 GRACE_PERIOD_MINUTES = 10
 
-def cleanup_expired_vms():
-    """Tự động xóa VM đã hết hạn quá grace period để giải phóng tài nguyên."""
+def stop_expired_vms():
+    """Tự động dừng VM đang running khi đến giờ hết hạn (real-time)."""
     now = datetime.now()
     users = load_all_users()
-    cleaned_count = 0
+    stopped_count = 0
     for uid, user in users.items():
         user_vms = get_user_vms(uid)
         for vid, vm in user_vms.items():
             expiry_str = vm.get("expiry_time", "")
             if not expiry_str:
-                continue
+                continue  # Chưa tính giờ — bỏ qua
             try:
                 expiry_dt = datetime.fromisoformat(expiry_str)
             except Exception:
                 continue
-            if now > expiry_dt + timedelta(minutes=GRACE_PERIOD_MINUTES):
-                # VM đã hết hạn quá 10 phút → tự động xóa
+            # Chỉ xử lý VM đang running và đã hết hạn
+            if now >= expiry_dt and vm.get("status") == "running":
                 vm_dir = get_user_vm_dir(uid, vid)
-                find_and_kill_qemu_for_vm(vm_dir)
-                with vm_lock:
-                    if vid in active_vms and active_vms[vid].get("process"):
-                        try:
-                            active_vms[vid]["process"].terminate()
-                            active_vms[vid]["process"].wait(timeout=5)
-                        except Exception:
-                            try:
-                                active_vms[vid]["process"].kill()
-                            except Exception:
-                                pass
-                    active_vms.pop(vid, None)
-                if vm_dir.exists():
-                    shutil.rmtree(vm_dir, ignore_errors=True)
-                append_vm_log(uid, vid, f"[AUTO-DELETE] VM đã hết hạn quá {GRACE_PERIOD_MINUTES} phút. Hệ thống tự động xóa để giải phóng tài nguyên.")
-                cleaned_count += 1
-                print(f"[AUTO-CLEANUP] Đã xóa VM {vid} của user {user.get('username', uid)} (hết hạn lúc {expiry_str})")
-    if cleaned_count > 0:
-        print(f"[AUTO-CLEANUP] Tổng cộng đã xóa {cleaned_count} VM hết hạn.")
+                _stop_vm_logged(uid, vid, vm_dir)
+                vm["status"] = "stopped"
+                vm["stopped_reason"] = "expired"
+                save_vm_data(uid, vid, vm)
+                append_vm_log(uid, vid, "[AUTO-STOP] VM đã hết hạn thuê. Hệ thống tự động dừng. VM vẫn được giữ lại để gia hạn.")
+                stopped_count += 1
+                print(f"[AUTO-STOP] Đã dừng VM {vid} của user {user.get('username', uid)} do hết hạn lúc {expiry_str}")
+    if stopped_count > 0:
+        print(f"[AUTO-STOP] Tổng cộng đã dừng {stopped_count} VM hết hạn.")
 
+def expired_vm_stop_worker():
+    while True:
+        try:
+            stop_expired_vms()
+        except Exception as e:
+            print(f"[EXPIRED STOP ERROR] {e}")
+        time.sleep(10)
+
+def cleanup_expired_vms():
+    """
+    VM hết hạn KHÔNG bị xóa tự động.
+    Chỉ dừng VM ở stop_expired_vms(); dữ liệu được giữ lại
+    để người dùng bấm Gia hạn.
+    """
+    return
 def expired_vm_cleanup_worker():
     while True:
         try:
@@ -1638,7 +2174,9 @@ body{font-family:'Inter',sans-serif;background:#f8fafc;color:#1e293b;min-height:
 <div>
 <div class="vm-header">
 <h4><i class="fab fa-windows" style="color:{{ settings.primary_color }};font-size:18px"></i> {{ vm.name }}</h4>
-{% if vm.is_expired %}
+{% if vm.status == 'creating' %}
+<span class="vm-status creating"><span class="status-dot"></span> Đang Tạo VM</span>
+{% elif vm.is_expired %}
 <span class="vm-status expired"><span class="status-dot"></span> Đã hết hạn</span>
 {% else %}
 <span class="vm-status {{ vm.status }}"><span class="status-dot"></span> {{ vm.status_text }}</span>
@@ -1653,6 +2191,7 @@ body{font-family:'Inter',sans-serif;background:#f8fafc;color:#1e293b;min-height:
 <div class="vm-info-row"><span>Mật khẩu:</span><strong style="color:#0f172a;font-family:monospace">{{ vm.password }}</strong></div>
 <div class="vm-info-row"><span>Chu kỳ thuê:</span><strong style="color:#0f172a">{{ vm.billing_text }}</strong></div>
 <div class="vm-info-row"><span>Hết hạn:</span><strong style="color:{% if vm.is_expired %}#dc2626{% else %}#d97706{% endif %}">{{ vm.expiry_text }}</strong></div>
+{% if vm.rdp_mode == 'tailscale' %}
 <div class="vm-info-row" style="background:#f1f5f9;padding:8px 10px;border-radius:6px;margin-top:4px">
 <span>Địa chỉ IP (Tailscale):</span>
 {% if vm.tailscale_ip %}
@@ -1661,6 +2200,34 @@ body{font-family:'Inter',sans-serif;background:#f8fafc;color:#1e293b;min-height:
 <span style="color:#d97706;font-size:12px"><i class="fas fa-spinner fa-spin"></i> Đang lấy IP...</span>
 {% endif %}
 </div>
+{% else %}
+<div class="vm-info-row" style="background:#f0fdf4;padding:8px 10px;border-radius:6px;margin-top:4px;border:1px solid #bbf7d0">
+<span><i class="fas fa-network-wired" style="color:#16a34a"></i> Pinggy RDP:</span>
+{% if vm.rdp_tunnel_url %}
+<strong style="color:#15803d;font-family:monospace;font-size:13px">{{ vm.rdp_tunnel_url }}</strong>
+{% elif vm.rdp_tunnel_enabled %}
+<span style="color:#d97706;font-size:12px"><i class="fas fa-spinner fa-spin"></i> Đang lấy endpoint...</span>
+{% else %}
+<span style="color:#64748b;font-size:12px">Không bật</span>
+{% endif %}
+</div>
+{% endif %}
+{% if vm.rdp_mode == 'rdp1h' and vm.rdp_tunnel_enabled %}
+<div class="vm-info-row" style="background:#f0fdf4;padding:8px 10px;border-radius:6px;margin-top:4px;border:1px solid #bbf7d0">
+<span><i class="fas fa-network-wired" style="color:#16a34a"></i> RDP 1h URL:</span>
+{% if vm.rdp_tunnel_url %}
+<strong style="color:#15803d;font-family:monospace;font-size:13px">{{ vm.rdp_tunnel_url }}</strong>
+{% else %}
+<span style="color:#d97706;font-size:12px"><i class="fas fa-spinner fa-spin"></i> Đang lấy tunnel...</span>
+{% endif %}
+</div>
+<div style="display:flex;gap:8px;margin-top:10px">
+<button class="btn-start" style="flex:1;font-size:12px;padding:6px" onclick="refreshRdpTunnel('{{ vm.id }}')"><i class="fas fa-sync-alt"></i> Lấy IP mới (thủ công)</button>
+<button class="btn-renew" style="flex:1;font-size:12px;padding:6px;{% if vm.rdp_tunnel_auto %}background:#dcfce7;color:#15803d{% else %}background:#fee2e2;color:#dc2626{% endif %}" onclick="toggleRdpAuto('{{ vm.id }}', {{ 'false' if vm.rdp_tunnel_auto else 'true' }})">
+<i class="fas fa-{% if vm.rdp_tunnel_auto %}pause-circle{% else %}play-circle{% endif %}"></i> {% if vm.rdp_tunnel_auto %}Tắt Auto{% else %}Bật Auto{% endif %}
+</button>
+</div>
+{% endif %}
 <div class="vm-info-row countdown-row" style="background:#e0f2fe;padding:6px 10px;border-radius:6px;margin-top:4px;display:none">
 <span><i class="fas fa-clock" style="color:#0284c7"></i> Còn lại:</span>
 <strong class="countdown-text" style="color:#0369a1;font-family:monospace">--</strong>
@@ -1793,16 +2360,32 @@ body{font-family:'Inter',sans-serif;background:#f8fafc;color:#1e293b;min-height:
 <label><i class="fas fa-server" style="color:{{ settings.primary_color }};margin-right:6px"></i> Chọn Server chạy VM</label>
 <select name="node_id" id="selectedNode" style="width:100%;padding:11px 14px;border:1px solid #cbd5e1;border-radius:8px;font-size:14px;outline:none;background:#fff;color:#0f172a;">
 {% for node_id, node in nodes.items() %}
-{% if node.enabled %}
-<option value="{{ node_id }}">{{ node.name }} {% if node.type == 'local' %}(Local){% else %}({{ node.host }}:{{ node.port }}){% endif %}</option>
+{% if node.enabled and not node.locked %}
+<option value="{{ node_id }}">{{ node.name }} {% if node.type == 'local' %}(Local){% else %}({{ node.host }}:{{ node.port }}){% endif %}{% if node.max_vms|default(0) > 0 %} [Tối đa {{ node.max_vms }} VM]{% endif %}</option>
+{% elif node.enabled and node.locked %}
+<option value="{{ node_id }}" disabled style="color:#bbb;background:#f5f5f5">🔒 {{ node.name }} — Đã khóa ({{ node.lock_reason|default('Hết tài nguyên') }})</option>
 {% endif %}
 {% endfor %}
 </select>
-<small style="color:#64748b;font-size:12px;display:block;margin-top:6px"><i class="fas fa-info-circle"></i> Chọn máy chủ để chạy VM. Có thể chọn Local hoặc Worker Node đã kết nối.</small>
+<small style="color:#64748b;font-size:12px;display:block;margin-top:6px"><i class="fas fa-info-circle"></i> Node bị khóa sẽ hiện màu xám và không thể chọn. Admin có thể mở khóa trong Quản lý Node.</small>
 </div>
 <div class="form-group">
-<label><i class="fas fa-key" style="color:{{ settings.primary_color }};margin-right:6px"></i> Tailscale Auth Key (<span style="color:red">* Bắt buộc</span>)</label>
-<input type="text" name="tailscale_key" placeholder="tskey-auth-xxxxxxxxxxxx" required>
+<label><i class="fas fa-network-wired" style="color:{{ settings.primary_color }};margin-right:6px"></i> Chế độ kết nối từ xa</label>
+<div style="display:flex;gap:10px;flex-wrap:wrap">
+<label class="rdp-mode-label" style="display:flex;align-items:center;gap:8px;cursor:pointer;background:#f8fafc;padding:12px 14px;border-radius:10px;border:2px solid #e2e8f0;flex:1;transition:all 0.2s" onmouseover="this.style.borderColor='#93c5fd'" onmouseout="if(!this.querySelector('input').checked)this.style.borderColor='#e2e8f0'">
+<input type="radio" name="rdp_mode" value="tailscale" checked style="width:18px;height:18px;cursor:pointer" onchange="toggleTailscaleKey();document.querySelectorAll('.rdp-mode-label').forEach(l=>{l.style.borderColor=l.querySelector('input').checked?'{{ settings.primary_color }}':'#e2e8f0';l.style.background=l.querySelector('input').checked?'#eff6ff':'#f8fafc'})"> 
+<div><div style="font-weight:700;font-size:14px">Tailscale VPN</div><div style="font-size:12px;color:#64748b">Kết nối ổn định qua mạng riêng</div></div>
+</label>
+<label class="rdp-mode-label" style="display:flex;align-items:center;gap:8px;cursor:pointer;background:#f8fafc;padding:12px 14px;border-radius:10px;border:2px solid #e2e8f0;flex:1;transition:all 0.2s" onmouseover="this.style.borderColor='#93c5fd'" onmouseout="if(!this.querySelector('input').checked)this.style.borderColor='#e2e8f0'">
+<input type="radio" name="rdp_mode" value="rdp1h" style="width:18px;height:18px;cursor:pointer" onchange="toggleTailscaleKey();document.querySelectorAll('.rdp-mode-label').forEach(l=>{l.style.borderColor=l.querySelector('input').checked?'{{ settings.primary_color }}':'#e2e8f0';l.style.background=l.querySelector('input').checked?'#eff6ff':'#f8fafc'})"> 
+<div><div style="font-weight:700;font-size:14px">RDP 1h (Pinggy)</div><div style="font-size:12px;color:#64748b">SSH Tunnel tự động refresh IP mới</div></div>
+</label>
+</div>
+<small style="color:#64748b;font-size:12px;display:block;margin-top:6px"><i class="fas fa-info-circle"></i> Chọn đúng 1 chế độ: Tailscale hoặc Pinggy. Pinggy chỉ chạy sau khi QEMU READY.</small>
+</div>
+<div class="form-group">
+<label><i class="fas fa-key" style="color:{{ settings.primary_color }};margin-right:6px"></i> Tailscale Auth Key (<span style="color:red">* Bắt buộc nếu chọn Tailscale</span>)</label>
+<input type="text" name="tailscale_key" id="tailscaleKeyInput" placeholder="tskey-auth-xxxxxxxxxxxx">
 <small style="color:#64748b;font-size:12px;display:block;margin-top:6px"><i class="fas fa-info-circle"></i> Lấy Auth Key tại bảng điều khiển tailscale.com để kích hoạt mạng RDP từ xa.</small>
 </div>
 <button type="submit" class="btn-submit" id="submitBtn"><i class="fas fa-rocket"></i> Xác nhận Tạo Máy Ảo Ngay</button>
@@ -1919,6 +2502,30 @@ function selectConfig(el){
     const val = el.dataset.config;
     document.getElementById('selectedConfig').value = val;
     updateCyclePrices(val);
+    updateCycleVisibility(val);
+}
+function updateCycleVisibility(configKey){
+    const cfg = vmConfigs[configKey];
+    if(!cfg) return;
+    const disabled = cfg.disabled_cycles || [];
+    const cycleOptions = document.querySelectorAll('#createModal .cycle-option');
+    cycleOptions.forEach(el => {
+        const cycle = el.dataset.cycle;
+        if(disabled.includes(cycle)){
+            el.style.display = 'none';
+            el.classList.remove('selected');
+        } else {
+            el.style.display = 'block';
+        }
+    });
+    // Chọn cycle đầu tiên còn hiển thị
+    const visible = document.querySelectorAll('#createModal .cycle-option:not([style*="display: none"])');
+    if(visible.length > 0){
+        visible.forEach(e => e.classList.remove('selected'));
+        visible[0].classList.add('selected');
+        document.getElementById('selectedCycle').value = visible[0].dataset.cycle;
+    }
+    updateTotalPrice();
 }
 function selectCycle(el){
     document.querySelectorAll('.cycle-option').forEach(e=>e.classList.remove('selected'));
@@ -1963,21 +2570,51 @@ function updateTotalPrice(){
 }
 function createVM(e){
     e.preventDefault();
+
     const configVal = document.getElementById('selectedConfig').value;
     const osVal = document.getElementById('selectedOS').value;
+    const modeEl = document.querySelector('input[name="rdp_mode"]:checked');
+    const mode = modeEl ? modeEl.value : '';
+
     if(!configVal){ showCenterNotice('Vui lòng chọn Cấu hình tài nguyên cho máy ảo!', true); return false; }
     if(!osVal){ showCenterNotice('Vui lòng chọn Hệ điều hành Windows!', true); return false; }
-    const btn=document.getElementById('submitBtn');
-    btn.disabled=true;
-    btn.innerHTML='<i class="fas fa-spinner fa-spin"></i> Đang khởi tạo máy ảo...';
-    const form=new FormData(e.target);
+    if(!mode){ showCenterNotice('Vui lòng chọn Tailscale hoặc Pinggy!', true); return false; }
+
+    const tsInput = document.getElementById('tailscaleKeyInput');
+    if(mode === 'tailscale' && !tsInput.value.trim()){
+        showCenterNotice('Bạn phải nhập Tailscale Auth Key khi chọn Tailscale!', true);
+        return false;
+    }
+
+    const btn = document.getElementById('submitBtn');
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Đang Tạo VM...';
+
+    const form = new FormData(e.target);
+    form.set('rdp_mode', mode);
+
+    // Tuyệt đối không gửi Tailscale key khi dùng Pinggy.
+    if(mode === 'rdp1h'){
+        form.set('tailscale_key', '');
+    }
+
     fetch('/api/vm/create',{method:'POST',body:form})
     .then(r=>r.json())
     .then(d=>{
-        if(d.success){ closeModal(); showCenterNotice('Khởi tạo thành công máy ảo mới!', false, 1800, () => location.reload()); }
-        else { showCenterNotice(d.error || 'Lỗi khởi tạo!', true); btn.disabled=false; btn.innerHTML='<i class="fas fa-rocket"></i> Xác nhận Tạo Máy Ảo Ngay'; }
+        if(d.success){
+            closeModal();
+            showCenterNotice('Đang Tạo VM. Hệ thống sẽ chỉ bắt đầu tính giờ sau khi QEMU READY.', false, 2200, () => location.reload());
+        } else {
+            showCenterNotice(d.error || 'Lỗi khởi tạo!', true);
+            btn.disabled=false;
+            btn.innerHTML='<i class="fas fa-rocket"></i> Xác nhận Tạo Máy Ảo Ngay';
+        }
     })
-    .catch(err=>{ showCenterNotice('Lỗi kết nối máy chủ!', true); btn.disabled=false; btn.innerHTML='<i class="fas fa-rocket"></i> Xác nhận Tạo Máy Ảo Ngay'; });
+    .catch(()=>{
+        showCenterNotice('Lỗi kết nối máy chủ!', true);
+        btn.disabled=false;
+        btn.innerHTML='<i class="fas fa-rocket"></i> Xác nhận Tạo Máy Ảo Ngay';
+    });
     return false;
 }
 function startVM(id){ showCenterNotice('Đang gửi lệnh bật máy ảo...', false, 1200); fetch('/api/vm/'+id+'/start',{method:'POST'}).then(r=>r.json()).then(d=>{ if(d.success){ showCenterNotice('Đã phát lệnh bật VM thành công.', false, 1500, () => location.reload()); } else showCenterNotice(d.error || 'Thất bại!', true); }); }
@@ -2030,6 +2667,119 @@ function renewVM(e){
     }).catch(err=>{ showCenterNotice('Lỗi kết nối máy chủ!', true); btn.disabled=false; btn.innerHTML='<i class="fas fa-check-circle"></i> Xác nhận Gia hạn'; });
     return false;
 }
+function refreshRdpTunnel(id){
+    showCenterNotice('Đang khởi động lại RDP tunnel...', false, 1500);
+    fetch('/api/vm/'+id+'/rdp-refresh',{method:'POST'})
+    .then(r=>r.json()).then(d=>{
+        if(d.success){ showCenterNotice('Đang lấy IP mới...', false, 1500, ()=>location.reload()); }
+        else showCenterNotice(d.error||'Thất bại!',true);
+    });
+}
+function toggleRdpAuto(id, auto){
+    const form = new FormData();
+    form.append('auto', auto?'1':'0');
+    fetch('/api/vm/'+id+'/rdp-toggle-auto',{method:'POST',body:form})
+    .then(r=>r.json()).then(d=>{
+        if(d.success){ showCenterNotice('Đã '+(auto?'bật':'tắt')+' auto refresh RDP.', false, 1200, ()=>location.reload()); }
+        else showCenterNotice(d.error||'Thất bại!',true);
+    });
+}
+let originalNodeOptions = [];
+function toggleTailscaleKey(){
+    const checked = document.querySelector('input[name="rdp_mode"]:checked');
+    if(!checked) return;
+
+    const mode = checked.value;
+    const input = document.getElementById('tailscaleKeyInput');
+    const label = input.parentElement.querySelector('label');
+
+    document.querySelectorAll('.rdp-mode-label').forEach(l=>{
+        const radio = l.querySelector('input');
+        const active = radio && radio.checked;
+        l.style.borderColor = active ? '{{ settings.primary_color }}' : '#e2e8f0';
+        l.style.background = active ? '#eff6ff' : '#f8fafc';
+    });
+
+    if(mode === 'rdp1h'){
+        input.disabled = true;
+        input.required = false;
+        input.style.background = '#f3f4f6';
+        input.style.color = '#9ca3af';
+        input.value = '';
+        if(label) label.innerHTML = '<i class="fas fa-key" style="color:{{ settings.primary_color }};margin-right:6px"></i> Tailscale Auth Key (<span style="color:#999">Không dùng khi chọn Pinggy</span>)';
+    } else {
+        input.disabled = false;
+        input.required = true;
+        input.style.background = '#fff';
+        input.style.color = '#0f172a';
+        if(label) label.innerHTML = '<i class="fas fa-key" style="color:{{ settings.primary_color }};margin-right:6px"></i> Tailscale Auth Key (<span style="color:red">* Bắt buộc</span>)';
+    }
+}
+function saveOriginalNodeOptions(){
+    const sel = document.getElementById('selectedNode');
+    originalNodeOptions = Array.from(sel.options).map(o => ({value:o.value, text:o.text, disabled:o.disabled, html:o.innerHTML}));
+}
+function checkNodeCapacity(configKey){
+    const sel = document.getElementById('selectedNode');
+    if(originalNodeOptions.length === 0) saveOriginalNodeOptions();
+    sel.innerHTML = '';
+    originalNodeOptions.forEach(opt => {
+        const o = document.createElement('option');
+        o.value = opt.value;
+        o.innerHTML = opt.html;
+        o.disabled = opt.disabled;
+        sel.add(o);
+    });
+    if(!configKey) return;
+    const form = new FormData();
+    form.append('config_key', configKey);
+    fetch('/api/node/check-capacity', {method:'POST', body:form})
+    .then(r=>r.json()).then(d=>{
+        if(d.success && d.nodes){
+            Array.from(sel.options).forEach(opt => {
+                if(opt.disabled) return;
+                const nid = opt.value;
+                const info = d.nodes[nid];
+                if(info && !info.ok){
+                    opt.disabled = true;
+                    opt.style.color = '#9ca3af';
+                    opt.style.background = '#f3f4f6';
+                    opt.innerHTML = '&#128274; ' + opt.innerHTML + ' — Hết tài nguyên';
+                }
+            });
+        }
+    });
+}
+const _origSelectConfig = selectConfig;
+selectConfig = function(el){
+    document.querySelectorAll('.config-option').forEach(e=>{
+        e.classList.remove('selected');
+        const icon = e.querySelector('.fa-check-circle');
+        if(icon) icon.style.opacity = '0';
+    });
+    el.classList.add('selected');
+    const icon = el.querySelector('.fa-check-circle');
+    if(icon) icon.style.opacity = '1';
+    const val = el.dataset.config;
+    document.getElementById('selectedConfig').value = val;
+    updateCyclePrices(val);
+    updateCycleVisibility(val);
+    checkNodeCapacity(val);
+}
+const _origOpenModal = openModal;
+openModal = function(){
+    document.querySelectorAll('.config-option').forEach(e=>{
+        e.classList.remove('selected');
+        const icon = e.querySelector('.fa-check-circle');
+        if(icon) icon.style.opacity = '0';
+    });
+    document.querySelectorAll('.os-option').forEach(e=>e.classList.remove('selected'));
+    document.getElementById('selectedConfig').value = '';
+    document.getElementById('selectedOS').value = '';
+    document.getElementById('createModal').classList.add('active');
+    saveOriginalNodeOptions();
+    toggleTailscaleKey();
+}
 </script>
 <script>
 function adminDeleteVM(userId, vmId, vmName){
@@ -2057,11 +2807,11 @@ Máy ảo <strong id="expiryVmName" style="color:#0f172a"></strong> sẽ hết h
 Vui lòng chọn hành động ngay bây giờ!
 </div>
 <div style="background:#fee2e2;border:1px solid #fecaca;color:#991b1b;padding:10px;border-radius:8px;margin-bottom:20px;font-weight:600;font-size:13px">
-<i class="fas fa-stopwatch"></i> Tự động dừng & xóa sau: <span id="expiryAutoDelete" style="font-size:18px;font-family:monospace">02:00</span> nếu không chọn
+<i class="fas fa-stop-circle"></i> VM sẽ được tự động dừng khi hết thời gian. Dữ liệu VM vẫn giữ lại để bạn gia hạn.
 </div>
 <div style="display:flex;gap:12px;justify-content:center">
-<button class="btn-submit" style="background:#dc2626;flex:1" onclick="expiryChooseNoRenew()"><i class="fas fa-trash"></i> Không gia hạn (Xóa VM)</button>
 <button class="btn-submit" style="background:#16a34a;flex:1" onclick="expiryChooseRenew()"><i class="fas fa-sync-alt"></i> Gia hạn ngay</button>
+<button class="btn-submit" style="background:#64748b;flex:1" onclick="document.getElementById('expiryAlertModal').classList.remove('active');expiryModalActive=false;"><i class="fas fa-times"></i> Đóng</button>
 </div>
 </div>
 </div>
@@ -2069,9 +2819,7 @@ Vui lòng chọn hành động ngay bây giờ!
 <script>
 (function(){
   const WARNING_SECONDS = 600; // 10 phút cảnh báo
-  const AUTO_DELETE_SECONDS = 120; // 2 phút tự động xóa
   let expiryModalActive = false;
-  let expiryAutoDeleteTimer = null;
   let currentExpiryVmId = null;
   let currentExpiryVmName = "";
 
@@ -2092,7 +2840,7 @@ Vui lòng chọn hành động ngay bây giờ!
       const vmName = card.dataset.name;
       const row = card.querySelector('.countdown-row');
       const txt = card.querySelector('.countdown-text');
-      if(!expiry || expiry === ""){ if(row) row.style.display='none'; return; }
+      if(!expiry || expiry === "" || expiry === "null"){ if(row) row.style.display='none'; return; }
       const end = new Date(expiry).getTime();
       const diff = end - now;
       if(row) row.style.display = 'flex';
@@ -2115,37 +2863,6 @@ Vui lòng chọn hành động ngay bây giờ!
     document.getElementById('expiryVmName').textContent = vmName;
     document.getElementById('expiryTimeLeft').textContent = formatCountdown(diffMs);
     document.getElementById('expiryAlertModal').classList.add('active');
-    startAutoDeleteCountdown();
-  }
-
-  function startAutoDeleteCountdown(){
-    let left = AUTO_DELETE_SECONDS;
-    const el = document.getElementById('expiryAutoDelete');
-    if(expiryAutoDeleteTimer) clearInterval(expiryAutoDeleteTimer);
-    expiryAutoDeleteTimer = setInterval(()=>{
-      left--;
-      const m = Math.floor(left/60);
-      const s = left%60;
-      el.textContent = `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
-      if(left <= 0){
-        clearInterval(expiryAutoDeleteTimer);
-        expiryAutoDeleteTimer = null;
-        document.getElementById('expiryAlertModal').classList.remove('active');
-        expiryModalActive = false;
-        // Tự động dừng rồi xóa
-        if(currentExpiryVmId){
-          fetch('/api/vm/'+currentExpiryVmId+'/stop',{method:'POST'})
-          .then(()=>{
-             setTimeout(()=>{
-               fetch('/api/vm/'+currentExpiryVmId+'/delete',{method:'POST'})
-               .then(()=>{ showCenterNotice('VM đã tự động dừng và xóa do hết hạn.',false,2000,()=>location.reload()); })
-               .catch(()=>showCenterNotice('Lỗi tự động xóa VM!',true));
-             }, 2000);
-          })
-          .catch(()=>showCenterNotice('Lỗi tự động dừng VM!',true));
-        }
-      }
-    }, 1000);
   }
 
   window.expiryChooseRenew = function(){
@@ -2170,14 +2887,6 @@ Vui lòng chọn hành động ngay bây giờ!
     }
   };
 
-  window.expiryChooseNoRenew = function(){
-    if(expiryAutoDeleteTimer){ clearInterval(expiryAutoDeleteTimer); expiryAutoDeleteTimer=null; }
-    document.getElementById('expiryAlertModal').classList.remove('active');
-    expiryModalActive = false;
-    if(currentExpiryVmId){
-      deleteVM(currentExpiryVmId);
-    }
-  };
 
   setInterval(updateCountdowns, 1000);
   updateCountdowns();
@@ -2745,6 +3454,20 @@ h1{font-size:22px;color:#1a237e}
 .btn-stop{background:#fef3c7;color:#b45309}
 .btn-delete{background:#fee2e2;color:#dc2626}
 .empty-state{grid-column:1/-1;background:#fff;padding:40px;text-align:center;border-radius:12px;border:1px solid #e0e0e0;color:#777}
+
+.node-card:hover{transform:translateY(-3px);box-shadow:0 8px 20px rgba(0,0,0,0.1)}
+.node-locked{filter:grayscale(0.6);opacity:0.85}
+.node-locked:hover{filter:grayscale(0.4);opacity:0.95}
+.node-detail-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:15px;margin-bottom:20px}
+.node-detail-card{background:#f8f9fa;border:1px solid #e0e0e0;border-radius:10px;padding:15px}
+.node-detail-card label{font-size:11px;color:#666;text-transform:uppercase;letter-spacing:0.5px;display:block;margin-bottom:4px}
+.node-detail-card .value{font-size:15px;font-weight:700;color:#1a237e}
+.node-detail-card .value-mono{font-family:monospace;font-size:14px}
+.node-vm-table{width:100%;border-collapse:collapse;font-size:12px;margin-top:10px}
+.node-vm-table th,.node-vm-table td{padding:8px 10px;border:1px solid #e0e0e0;text-align:left}
+.node-vm-table th{background:#f0f7ff;font-weight:600;color:#1a237e}
+.node-vm-table tr:hover{background:#f8f9fa}
+.node-actions-row{display:flex;gap:10px;margin-top:15px;padding-top:15px;border-top:1px solid #e0e0e0}
 </style>
 </head>
 <body>
@@ -3036,6 +3759,27 @@ th{background:#f9f9f9;font-weight:600;color:#555}
 .slider:before{position:absolute;content:"";height:18px;width:18px;left:3px;bottom:3px;background-color:white;transition:.4s;border-radius:50%}
 input:checked + .slider{background-color:{{ settings.primary_color }};}
 input:checked + .slider:before{transform:translateX(20px)}
+
+/* ===== NODE DETAIL MODAL STYLES ===== */
+.node-detail-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:20px}
+.node-detail-card{background:linear-gradient(135deg,#ffffff 0%,#f8fafc 100%);border:1px solid #e2e8f0;border-radius:10px;padding:14px;box-shadow:0 2px 6px rgba(0,0,0,0.03);transition:all .2s}
+.node-detail-card:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,0.06)}
+.node-detail-card label{font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:5px;font-weight:600}
+.node-detail-card .value{font-size:15px;font-weight:700;color:#1e293b}
+.node-detail-card .value-mono{font-family:'SF Mono',monospace;font-size:13px;color:#0f172a;word-break:break-all}
+.node-progress-wrap{margin-bottom:14px;background:#f1f5f9;border-radius:8px;padding:12px}
+.node-progress-label{display:flex;justify-content:space-between;font-size:12px;color:#475569;margin-bottom:5px;font-weight:600}
+.node-progress-bar{background:#e2e8f0;border-radius:6px;height:10px;overflow:hidden}
+.node-progress-fill{height:100%;border-radius:6px;transition:width .4s ease}
+.node-vm-section{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:16px;margin-bottom:16px}
+.node-vm-section h4{margin:0 0 12px 0;font-size:15px;color:#1e293b;display:flex;align-items:center;gap:8px}
+.node-vm-table{width:100%;border-collapse:separate;border-spacing:0;font-size:13px}
+.node-vm-table th{background:#f1f5f9;color:#475569;font-weight:600;padding:10px 12px;text-align:left;border-bottom:2px solid #e2e8f0}
+.node-vm-table td{padding:10px 12px;border-bottom:1px solid #f1f5f9;color:#334155}
+.node-vm-table tr:hover td{background:#f8fafc}
+.node-vm-table code{font-family:'SF Mono',monospace;font-size:11px;color:#64748b;background:#f1f5f9;padding:2px 6px;border-radius:4px}
+.node-empty-vm{background:#f8fafc;border:2px dashed #e2e8f0;border-radius:10px;padding:24px;text-align:center;color:#94a3b8;font-size:13px}
+.node-actions-row{display:flex;gap:10px;margin-top:16px;padding-top:16px;border-top:1px solid #e2e8f0;flex-wrap:wrap}
 </style>
 </head>
 <body>
@@ -3054,52 +3798,106 @@ input:checked + .slider:before{transform:translateX(20px)}
 <div class="small-note" style="margin-bottom:15px">
 <strong>Worker Node</strong> là máy chủ phụ chạy QEMU/KVM. Khi thêm node, hãy chạy file này ở mode <b>Worker (2)</b> trên máy phụ, sau đó nhập IP và Token vào đây.
 </div>
-<table>
-<thead>
-<tr>
-<th>ID</th>
-<th>Tên Server</th>
-<th>Tunnel URL / Kết nối</th>
-<th>Loại</th>
-<th>Trạng thái</th>
-<th>Hành động</th>
-</tr>
-</thead>
-<tbody>
+<div class="node-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(380px,1fr));gap:20px;margin-bottom:20px">
 {% for node_id, node in nodes.items() %}
-<tr>
-<td><code>{{ node_id }}</code></td>
-<td><strong>{{ node.name }}</strong></td>
-<td>
-{% if node.tunnel_url %}
-<a href="{{ node.tunnel_url }}" target="_blank" style="color:#2196F3;font-size:12px;word-break:break-all">{{ node.tunnel_url }}</a>
-{% elif node.type == 'local' %}
-<span style="color:#666;font-size:12px">127.0.0.1:5000</span>
-{% else %}
-<span style="color:#999;font-size:12px"><i class="fas fa-hourglass-half"></i> Chờ Worker kết nối...</span>
+<div class="node-card {% if node.locked %}node-locked{% endif %}" onclick="openNodeDetailModal('{{ node_id }}')" style="background:#fff;border:2px solid {% if node.locked %}#ffcdd2{% else %}#e0e0e0{% endif %};border-radius:12px;padding:20px;box-shadow:0 2px 8px rgba(0,0,0,0.04);transition:all 0.2s;position:relative;overflow:hidden;cursor:pointer">
+{% if node.locked %}
+<div style="position:absolute;top:0;right:0;background:#c62828;color:#fff;padding:4px 12px;border-radius:0 0 0 8px;font-size:11px;font-weight:700;display:flex;align-items:center;gap:5px;z-index:2">
+<i class="fas fa-lock"></i> ĐÃ KHÓA
+</div>
+<div class="node-locked-overlay" style="position:absolute;top:0;left:0;right:0;bottom:0;background:rgba(200,200,200,0.15);pointer-events:none;z-index:1"></div>
 {% endif %}
-</td>
-<td>{% if node.type == 'local' %}<span class="badge-user">Local</span>{% else %}<span class="badge-admin">Worker</span>{% endif %}</td>
-<td>
-{% if node._status.success %}
-<span style="color:#2e7d32;font-weight:600"><i class="fas fa-check-circle"></i> Online</span>
-<small style="color:#666;display:block">CPU: {{ node._status.cpu_percent }}% | RAM: {{ node._status.ram_percent }}%</small>
+<div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:12px;position:relative;z-index:2">
+<div>
+<div style="font-size:16px;font-weight:700;color:{% if node.locked %}#888{% else %}#1a237e{% endif %};display:flex;align-items:center;gap:8px">
+<i class="fas fa-server" style="color:{% if node.locked %}#999{% else %}{{ settings.primary_color }}{% endif %}"></i> {{ node.name }}
+{% if node.type == 'local' %}<span class="badge-user">Local</span>{% else %}<span class="badge-admin">Worker</span>{% endif %}
+{% if node.locked %}<i class="fas fa-lock" style="color:#c62828;font-size:14px" title="{{ node.lock_reason|default('Đã khóa') }}"></i>{% endif %}
+</div>
+<div style="font-size:12px;color:#888;margin-top:4px;font-family:monospace">ID: {{ node_id }}</div>
+</div>
+{% if node._status.online or node._status.success %}
+<div style="background:#e8f5e9;color:#2e7d32;padding:4px 10px;border-radius:20px;font-size:12px;font-weight:600;display:flex;align-items:center;gap:5px">
+<i class="fas fa-circle" style="font-size:8px"></i> Online
+</div>
 {% else %}
-<span style="color:#c62828;font-weight:600"><i class="fas fa-times-circle"></i> Offline</span>
+<div style="background:#ffebee;color:#c62828;padding:4px 10px;border-radius:20px;font-size:12px;font-weight:600;display:flex;align-items:center;gap:5px">
+<i class="fas fa-circle" style="font-size:8px"></i> Offline
+</div>
 {% endif %}
-</td>
-<td>
-{% if node_id != 'local' %}
-<button class="btn-action btn-edit" onclick="testNode('{{ node_id }}')"><i class="fas fa-plug"></i> Test</button>
-<button class="btn-action btn-del" onclick="deleteNode('{{ node_id }}')"><i class="fas fa-trash"></i> Xóa</button>
-{% else %}
-<span style="color:#888;font-size:12px">Mặc định</span>
+</div>
+<div style="background:#f8f9fa;border-radius:8px;padding:12px;margin-bottom:12px;position:relative;z-index:2">
+<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:10px;font-size:13px">
+<div><span style="color:#666">Hệ điều hành:</span> <strong style="color:{% if node.locked %}#888{% else %}#1a237e{% endif %}">{{ node._status.os|default('N/A') }} {{ node._status.os_version|default('') }}</strong></div>
+<div><span style="color:#666">Hostname:</span> <strong style="color:{% if node.locked %}#888{% else %}#1a237e{% endif %}">{{ node._status.hostname|default('N/A') }}</strong></div>
+<div><span style="color:#666">CPU:</span> <strong style="color:{% if node.locked %}#888{% else %}#1a237e{% endif %}">{{ node._status.cpu_cores|default(0) }}C / {{ node._status.cpu_threads|default(0) }}T</strong></div>
+<div><span style="color:#666">CPU Load:</span> <strong style="color:{% if (node._status.cpu_percent|default(0)) > 80 %}#c62828{% elif (node._status.cpu_percent|default(0)) > 50 %}#e65100{% else %}#2e7d32{% endif %}">{{ node._status.cpu_percent|default(0) }}%</strong></div>
+<div><span style="color:#666">RAM:</span> <strong style="color:{% if node.locked %}#888{% else %}#1a237e{% endif %}">{{ node._status.ram_used_gb|default(0) }} / {{ node._status.ram_total_gb|default(0) }} GB</strong></div>
+<div><span style="color:#666">RAM Free:</span> <strong style="color:{% if node.locked %}#888{% else %}#2e7d32{% endif %}">{{ node._status.ram_free_gb|default(0) }} GB</strong></div>
+<div><span style="color:#666">Disk:</span> <strong style="color:{% if node.locked %}#888{% else %}#1a237e{% endif %}">{{ node._status.disk_used_gb|default(0) }} / {{ node._status.disk_total_gb|default(0) }} GB</strong></div>
+<div><span style="color:#666">Disk Free:</span> <strong style="color:{% if node.locked %}#888{% else %}#2e7d32{% endif %}">{{ node._status.disk_free_gb|default(0) }} GB</strong></div>
+</div>
+{% if node._status.ram_total_gb|default(0) > 0 %}
+<div style="margin-top:10px">
+<div style="display:flex;justify-content:space-between;font-size:11px;color:#666;margin-bottom:3px"><span>RAM</span><span>{{ node._status.ram_percent|default(0) }}%</span></div>
+<div style="background:#e0e0e0;border-radius:4px;height:6px;overflow:hidden"><div style="background:{% if (node._status.ram_percent|default(0)) > 85 %}#ef4444{% elif (node._status.ram_percent|default(0)) > 60 %}#f59e0b{% else %}#22c55e{% endif %};height:100%;width:{{ node._status.ram_percent|default(0) }}%;border-radius:4px;transition:width 0.3s"></div></div>
+</div>
+<div style="margin-top:6px">
+<div style="display:flex;justify-content:space-between;font-size:11px;color:#666;margin-bottom:3px"><span>Disk</span><span>{{ node._status.disk_percent|default(0) }}%</span></div>
+<div style="background:#e0e0e0;border-radius:4px;height:6px;overflow:hidden"><div style="background:{% if (node._status.disk_percent|default(0)) > 90 %}#ef4444{% elif (node._status.disk_percent|default(0)) > 75 %}#f59e0b{% else %}#22c55e{% endif %};height:100%;width:{{ node._status.disk_percent|default(0) }}%;border-radius:4px;transition:width 0.3s"></div></div>
+</div>
 {% endif %}
-</td>
-</tr>
+</div>
+<!-- VM COUNT & USER LIST -->
+<div style="background:#fff3e0;border:1px solid #ffcc80;border-radius:8px;padding:10px 12px;margin-bottom:12px;position:relative;z-index:2">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+<span style="font-size:13px;font-weight:600;color:#e65100"><i class="fas fa-server"></i> Số VM trên node:</span>
+<span style="font-size:16px;font-weight:800;color:#e65100">{{ node._vm_count|default(0) }}{% if node.max_vms|default(0) > 0 %} / {{ node.max_vms }} <span style="font-size:11px;color:#666">(giới hạn)</span>{% endif %}</span>
+</div>
+{% if node._vm_users %}
+<div style="font-size:12px;color:#555;line-height:1.5">
+<i class="fas fa-users" style="color:#666;margin-right:4px"></i> User: 
+{% for u in node._vm_users %}
+<span style="background:#e3f2fd;color:#1565c0;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;margin-right:4px;display:inline-block;margin-bottom:3px">{{ u }}</span>
 {% endfor %}
-</tbody>
-</table>
+</div>
+{% else %}
+<div style="font-size:12px;color:#888"><i class="fas fa-info-circle"></i> Chưa có VM nào trên node này.</div>
+{% endif %}
+</div>
+<!-- BADGE ROW -->
+<div style="display:flex;gap:8px;flex-wrap:wrap;position:relative;z-index:2">
+<span style="background:{% if node.locked %}#ffebee;color:#c62828{% else %}#e8f5e9;color:#2e7d32{% endif %};padding:4px 10px;border-radius:20px;font-size:11px;font-weight:600;display:flex;align-items:center;gap:5px">
+<i class="fas fa-{% if node.locked %}lock{% else %}lock-open{% endif %}"></i> {% if node.locked %}Đã khóa{% else %}Đang mở{% endif %}
+</span>
+{% if node.auto_lock|default(True) %}
+<span style="background:#fff3e0;color:#e65100;padding:4px 10px;border-radius:20px;font-size:11px;font-weight:600;display:flex;align-items:center;gap:5px">
+<i class="fas fa-shield-alt"></i> Auto-Lock
+</span>
+{% endif %}
+{% if node.hide_when_full|default(False) %}
+<span style="background:#fce7f3;color:#db2777;padding:4px 10px;border-radius:20px;font-size:11px;font-weight:600;display:flex;align-items:center;gap:5px">
+<i class="fas fa-eye-slash"></i> Ẩn khi đầy
+</span>
+{% endif %}
+<span style="background:#f3e8ff;color:#7c3aed;padding:4px 10px;border-radius:20px;font-size:11px;font-weight:600;display:flex;align-items:center;gap:5px">
+<i class="fas fa-mouse-pointer"></i> Bấm để chỉnh
+</span>
+</div>
+</div>
+{% endfor %}
+</div>
+
+<!-- NODE DETAIL MODAL -->
+<div class="modal-overlay" id="nodeDetailModal">
+<div class="modal" style="width:720px;max-height:90vh;overflow-y:auto">
+<div class="modal-header">
+<h3 id="nodeDetailTitle" style="font-size:18px"><i class="fas fa-server" style="color:#2196F3"></i> Chi tiết Node</h3>
+<button type="button" onclick="closeNodeDetailModal()" style="background:none;border:none;font-size:20px;cursor:pointer">&times;</button>
+</div>
+<div id="nodeDetailContent"></div>
+</div>
+</div>
 </div>
 
 <!-- MODAL THÊM / SỬA NODE -->
@@ -3112,14 +3910,27 @@ input:checked + .slider:before{transform:translateX(20px)}
 <form id="nodeForm" onsubmit="saveNode(event)">
 <div class="form-group" style="margin-bottom:12px"><label>ID Node (vd: node1)</label><input id="nodeId" name="node_id" pattern="[A-Za-z0-9_-]+" required placeholder="node1"></div>
 <div class="form-group" style="margin-bottom:12px"><label>Tên hiển thị</label><input id="nodeName" name="name" required placeholder="Server 1 - VPS HCM"></div>
+<div class="form-row" style="grid-template-columns:1fr 1fr">
+<div class="form-group" style="margin-bottom:12px"><label>IP / Host</label><input id="nodeHost" name="host" placeholder="192.168.1.100" value="127.0.0.1"></div>
+<div class="form-group" style="margin-bottom:12px"><label>Port</label><input id="nodePort" name="port" type="number" value="5001" placeholder="5001"></div>
+</div>
 <div class="form-group" style="margin-bottom:12px"><label>Worker Token (lấy từ máy Worker)</label><input id="nodeToken" name="token" placeholder="abc123..." required></div>
+<div class="form-group" style="margin-bottom:12px"><label>Tunnel URL (tùy chọn)</label><input id="nodeTunnel" name="tunnel_url" placeholder="https://xxx.trycloudflare.com"></div>
+<div class="form-row" style="grid-template-columns:1fr 1fr">
+<div class="form-group" style="margin-bottom:12px"><label>Giới hạn số VM (0 = không giới hạn)</label><input id="nodeMaxVms" name="max_vms" type="number" min="0" value="0" placeholder="0"></div>
+<div class="form-group" style="margin-bottom:12px;display:flex;align-items:center;gap:8px;flex-direction:column;justify-content:center">
+<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;font-weight:600">
+<input type="checkbox" id="nodeAutoLock" name="auto_lock" checked style="width:18px;height:18px"> Tự động khóa khi đầy
+</label>
+</div>
+</div>
 <div class="form-group" style="margin-bottom:15px">
 <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
 <input type="checkbox" id="nodeEnabled" name="enabled" checked style="width:18px;height:18px"> Kích hoạt node
 </label>
 </div>
 <div style="background:#fff3e0;border:1px solid #ffcc80;padding:10px;border-radius:6px;font-size:12px;color:#e65100;margin-bottom:12px">
-<i class="fas fa-info-circle"></i> <strong>Không cần nhập IP!</strong> Worker sẽ tự động chạy tunnel và gửi URL về Master khi khởi động.
+<i class="fas fa-info-circle"></i> <strong>Lưu ý:</strong> Nếu Worker đã tự đăng ký, Tunnel URL sẽ tự cập nhật. Chỉ cần nhập Token đúng là đủ.
 </div>
 <button type="submit" class="btn-action btn-add" style="width:100%;padding:11px;justify-content:center;font-size:14px;margin-top:5px"><i class="fas fa-save"></i> Lưu Node</button>
 </form>
@@ -3254,6 +4065,16 @@ input:checked + .slider:before{transform:translateX(20px)}
 <div class="form-row">
 <div class="form-group"><label>Giá / tuần (VNĐ)</label><input id="configPriceWeekly" type="number" name="price_weekly" min="0" step="1" required></div>
 <div class="form-group"><label>Giá / tháng (VNĐ)</label><input id="configPriceMonthly" type="number" name="price_monthly" min="0" step="1" required></div>
+</div>
+<div class="form-group" style="margin-bottom:12px">
+<label style="margin-bottom:8px;display:block">Khóa chu kỳ thuê (User không thể chọn khi tạo VM)</label>
+<div style="display:flex;gap:12px;flex-wrap:wrap">
+<label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;font-weight:500;background:#f8f9fa;padding:8px 12px;border-radius:6px;border:1px solid #e0e0e0"><input type="checkbox" name="disable_minutely" value="1"> <i class="fas fa-stopwatch" style="color:#7c3aed"></i> Theo phút</label>
+<label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;font-weight:500;background:#f8f9fa;padding:8px 12px;border-radius:6px;border:1px solid #e0e0e0"><input type="checkbox" name="disable_hourly" value="1"> <i class="fas fa-hourglass-half" style="color:#2e7d32"></i> Theo giờ</label>
+<label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;font-weight:500;background:#f8f9fa;padding:8px 12px;border-radius:6px;border:1px solid #e0e0e0"><input type="checkbox" name="disable_daily" value="1"> <i class="fas fa-sun" style="color:#e65100"></i> Theo ngày</label>
+<label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;font-weight:500;background:#f8f9fa;padding:8px 12px;border-radius:6px;border:1px solid #e0e0e0"><input type="checkbox" name="disable_weekly" value="1"> <i class="fas fa-calendar-week" style="color:#db2777"></i> Theo tuần</label>
+<label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;font-weight:500;background:#f8f9fa;padding:8px 12px;border-radius:6px;border:1px solid #e0e0e0"><input type="checkbox" name="disable_monthly" value="1"> <i class="fas fa-calendar-alt" style="color:#1565c0"></i> Theo tháng</label>
+</div>
 </div>
 <div class="small-note">Nhập đúng giá cho 5 đơn vị thuê: phút / giờ / ngày / tuần / tháng.</div>
 <button type="submit" class="btn-action btn-add" style="width:100%;padding:11px;justify-content:center;font-size:14px;margin-top:15px"><i class="fas fa-save"></i> Lưu cấu hình</button>
@@ -3690,6 +4511,12 @@ function editConfig(key,cfg){
     document.getElementById('configPriceDaily').value=cfg.price_daily || 0;
     document.getElementById('configPriceWeekly').value=cfg.price_weekly || 0;
     document.getElementById('configPriceMonthly').value=cfg.price_monthly || 0;
+    const dc = cfg.disabled_cycles || [];
+    document.querySelector('input[name="disable_minutely"]').checked = dc.includes('minutely');
+    document.querySelector('input[name="disable_hourly"]').checked = dc.includes('hourly');
+    document.querySelector('input[name="disable_daily"]').checked = dc.includes('daily');
+    document.querySelector('input[name="disable_weekly"]').checked = dc.includes('weekly');
+    document.querySelector('input[name="disable_monthly"]').checked = dc.includes('monthly');
     document.getElementById('configModal').classList.add('active');
 }
 function closeConfigModal(){ document.getElementById('configModal').classList.remove('active'); }
@@ -3844,11 +4671,31 @@ function closeNodeModal(){ document.getElementById('nodeModal').classList.remove
 function saveNode(e){
     e.preventDefault();
     const form = new FormData(e.target);
+    const nodeIdField = document.getElementById('nodeId');
+    if(nodeIdField.disabled){
+        form.append('node_id', nodeIdField.value);
+    }
     fetch('/api/admin/node/save', {method:'POST', body:form})
     .then(r=>r.json()).then(d=>{
         if(d.success){ closeNodeModal(); showCenterNotice('Đã lưu Node thành công!', false, 1500, ()=>location.reload()); }
         else showCenterNotice(d.error || 'Lỗi lưu Node!', true);
     }).catch(()=>showCenterNotice('Không thể kết nối máy chủ!', true));
+}
+function editNode(nodeId){
+    const node = nodeData[nodeId];
+    if(!node) return;
+    document.getElementById('nodeModalTitle').innerText = 'Chỉnh sửa Worker Node';
+    document.getElementById('nodeId').value = nodeId;
+    document.getElementById('nodeId').disabled = true;
+    document.getElementById('nodeName').value = node.name || '';
+    document.getElementById('nodeHost').value = node.host || '';
+    document.getElementById('nodePort').value = node.port || 5001;
+    document.getElementById('nodeToken').value = node.token || '';
+    document.getElementById('nodeTunnel').value = node.tunnel_url || '';
+    document.getElementById('nodeMaxVms').value = node.max_vms || 0;
+    document.getElementById('nodeAutoLock').checked = node.auto_lock !== false;
+    document.getElementById('nodeEnabled').checked = node.enabled !== false;
+    document.getElementById('nodeModal').classList.add('active');
 }
 function deleteNode(nodeId){
     if(!confirm('Xóa Worker Node '+nodeId+'?')) return;
@@ -3866,6 +4713,135 @@ function testNode(nodeId){
     .then(r=>r.json()).then(d=>{
         if(d.success) showCenterNotice(d.message || 'Kết nối thành công!', false, 2500);
         else showCenterNotice(d.error || 'Kết nối thất bại!', true, 3000);
+    }).catch(()=>showCenterNotice('Không thể kết nối máy chủ!', true));
+}
+// ===== NODE DETAIL MODAL =====
+const nodeData = {{ nodes_for_js|tojson }};
+const nodeVmsData = {{ vms_for_js|tojson }};
+
+function openNodeDetailModal(nodeId){
+    const node = nodeData[nodeId];
+    if(!node){
+        showCenterNotice('Không tìm thấy thông tin node!', true);
+        return;
+    }
+    const vms = nodeVmsData[nodeId] || [];
+    const status = node._status || {};
+    const isLocal = nodeId === 'local';
+    const isLocked = node.locked || false;
+
+    document.getElementById('nodeDetailTitle').innerHTML = 
+        `<i class="fas fa-server" style="color:${isLocked ? '#999' : '#2196F3'}"></i> ` + 
+        (node.name || nodeId) + 
+        (isLocal ? ' <span class="badge-user">Local</span>' : ' <span class="badge-admin">Worker</span>') +
+        (isLocked ? ' <i class="fas fa-lock" style="color:#c62828"></i>' : '');
+
+    let html = `<div class="node-detail-grid">`;
+    html += `<div class="node-detail-card"><label>Hệ điều hành</label><div class="value">${status.os || 'N/A'} ${status.os_version || ''}</div></div>`;
+    html += `<div class="node-detail-card"><label>Hostname</label><div class="value value-mono">${status.hostname || 'N/A'}</div></div>`;
+    html += `<div class="node-detail-card"><label>CPU Cores / Threads</label><div class="value">${status.cpu_cores || 0}C / ${status.cpu_threads || 0}T</div></div>`;
+    html += `<div class="node-detail-card"><label>CPU Load</label><div class="value" style="color:${(status.cpu_percent||0)>80?'#c62828':(status.cpu_percent||0)>50?'#e65100':'#2e7d32'}">${status.cpu_percent || 0}%</div></div>`;
+    html += `<div class="node-detail-card"><label>RAM Tổng</label><div class="value">${status.ram_total_gb || 0} GB</div></div>`;
+    html += `<div class="node-detail-card"><label>RAM Đã dùng</label><div class="value">${status.ram_used_gb || 0} GB</div></div>`;
+    html += `<div class="node-detail-card"><label>RAM Còn trống</label><div class="value" style="color:#2e7d32">${status.ram_free_gb || 0} GB</div></div>`;
+    html += `<div class="node-detail-card"><label>RAM Usage</label><div class="value" style="color:${(status.ram_percent||0)>85?'#c62828':(status.ram_percent||0)>60?'#e65100':'#2e7d32'}">${status.ram_percent || 0}%</div></div>`;
+    html += `<div class="node-detail-card"><label>Disk Tổng</label><div class="value">${status.disk_total_gb || 0} GB</div></div>`;
+    html += `<div class="node-detail-card"><label>Disk Đã dùng</label><div class="value">${status.disk_used_gb || 0} GB</div></div>`;
+    html += `<div class="node-detail-card"><label>Disk Còn trống</label><div class="value" style="color:#2e7d32">${status.disk_free_gb || 0} GB</div></div>`;
+    html += `<div class="node-detail-card"><label>Disk Usage</label><div class="value" style="color:${(status.disk_percent||0)>90?'#c62828':(status.disk_percent||0)>75?'#e65100':'#2e7d32'}">${status.disk_percent || 0}%</div></div>`;
+    html += `<div class="node-detail-card"><label>Uptime</label><div class="value">${status.uptime || 'N/A'}</div></div>`;
+    html += `<div class="node-detail-card"><label>Kết nối</label><div class="value value-mono" style="font-size:12px">${node.tunnel_url || (node.host + ':' + node.port)}</div></div>`;
+    html += `</div>`;
+
+    // Progress bars
+    const cpuPct = Math.min(status.cpu_percent||0, 100);
+    const ramPct = Math.min(status.ram_percent||0, 100);
+    const diskPct = Math.min(status.disk_percent||0, 100);
+    const cpuColor = cpuPct>80?'#ef4444':cpuPct>50?'#f59e0b':'#22c55e';
+    const ramColor = ramPct>85?'#ef4444':ramPct>60?'#f59e0b':'#22c55e';
+    const diskColor = diskPct>90?'#ef4444':diskPct>75?'#f59e0b':'#22c55e';
+
+    html += `<div class="node-progress-wrap">`;
+    html += `<div class="node-progress-label"><span>CPU Load</span><span>${cpuPct}%</span></div>`;
+    html += `<div class="node-progress-bar"><div class="node-progress-fill" style="background:${cpuColor};width:${cpuPct}%"></div></div>`;
+    html += `</div>`;
+    html += `<div class="node-progress-wrap">`;
+    html += `<div class="node-progress-label"><span>RAM Usage</span><span>${ramPct}%</span></div>`;
+    html += `<div class="node-progress-bar"><div class="node-progress-fill" style="background:${ramColor};width:${ramPct}%"></div></div>`;
+    html += `</div>`;
+    html += `<div class="node-progress-wrap">`;
+    html += `<div class="node-progress-label"><span>Disk Usage</span><span>${diskPct}%</span></div>`;
+    html += `<div class="node-progress-bar"><div class="node-progress-fill" style="background:${diskColor};width:${diskPct}%"></div></div>`;
+    html += `</div>`;
+
+    // VM List
+    html += `<div class="node-vm-section">`;
+    html += `<h4><i class="fas fa-server" style="color:#2196F3"></i> Danh sách VM trên node (${vms.length})</h4>`;
+    if(vms.length > 0){
+        html += `<table class="node-vm-table"><thead><tr><th>Tên VM</th><th>User</th><th>Trạng thái</th><th>CPU</th><th>RAM</th><th>Disk</th><th>Hết hạn</th></tr></thead><tbody>`;
+        vms.forEach(vm => {
+            const statusColor = vm.status === 'running' ? '#2e7d32' : (vm.status === 'creating' ? '#e65100' : '#c62828');
+            const statusText = vm.status === 'running' ? 'Đang chạy' : (vm.status === 'creating' ? 'Đang tạo' : 'Đã dừng');
+            html += `<tr><td><strong>${vm.vm_name}</strong><br><code>${vm.vm_id}</code></td>`;
+            html += `<td>${vm.username}</td>`;
+            html += `<td style="color:${statusColor};font-weight:600">${statusText}</td>`;
+            html += `<td>${vm.cpu}C</td><td>${vm.ram}G</td><td>${vm.disk}G</td>`;
+            html += `<td>${vm.expiry_time ? vm.expiry_time.substring(0,16).replace('T',' ') : 'Không giới hạn'}</td></tr>`;
+        });
+        html += `</tbody></table>`;
+    } else {
+        html += `<div class="node-empty-vm"><i class="fas fa-inbox" style="font-size:28px;margin-bottom:8px;display:block;color:#cbd5e1"></i>Chưa có VM nào trên node này.</div>`;
+    }
+    html += `</div>`;
+
+    // Actions
+    html += `<div class="node-actions-row">`;
+    html += `<button class="btn-action btn-edit" onclick="testNode('${nodeId}')"><i class="fas fa-plug"></i> Test kết nối</button>`;
+    html += `<button class="btn-action btn-lock" onclick="toggleNodeLock('${nodeId}', ${!isLocked});closeNodeDetailModal();"><i class="fas fa-${isLocked ? 'lock-open' : 'lock'}"></i> ${isLocked ? 'Mở khóa Node' : 'Khóa Node'}</button>`;
+    if(!isLocal){
+        html += `<button class="btn-action btn-del" onclick="if(confirm('Xóa node này?')){deleteNode('${nodeId}');closeNodeDetailModal();}"><i class="fas fa-trash"></i> Xóa Node</button>`;
+    }
+    html += `</div>`;
+
+    document.getElementById('nodeDetailContent').innerHTML = html;
+    document.getElementById('nodeDetailModal').classList.add('active');
+}
+function closeNodeDetailModal(){ document.getElementById('nodeDetailModal').classList.remove('active'); }
+
+function toggleNodeLock(nodeId, lock){
+    const action = lock ? 'khóa' : 'mở khóa';
+    if(!confirm(`Bạn có chắc muốn ${action} node này?`)) return;
+    const form = new FormData();
+    form.append('node_id', nodeId);
+    form.append('lock', lock ? '1' : '0');
+    fetch('/api/admin/node/toggle-lock', {method:'POST', body:form})
+    .then(r=>r.json()).then(d=>{
+        if(d.success){ showCenterNotice(`Đã ${action} node thành công.`, false, 1500, ()=>location.reload()); }
+        else { showCenterNotice(d.error || 'Thất bại!', true); }
+    }).catch(()=>showCenterNotice('Không thể kết nối máy chủ!', true));
+}
+
+function saveNodeSettings(nodeId){
+    const maxVms = document.getElementById('nodeSettingMaxVms').value;
+    const autoLock = document.getElementById('nodeSettingAutoLock').checked;
+    const hideFull = document.getElementById('nodeSettingHideFull').checked;
+    const node = nodeData[nodeId];
+    if(!node) return;
+    const form = new FormData();
+    form.append('node_id', nodeId);
+    form.append('name', node.name || nodeId);
+    form.append('host', node.host || '');
+    form.append('port', node.port || 5001);
+    form.append('token', node.token || '');
+    form.append('tunnel_url', node.tunnel_url || '');
+    form.append('max_vms', maxVms);
+    form.append('auto_lock', autoLock ? 'on' : '');
+    form.append('enabled', node.enabled !== false ? 'on' : '');
+    form.append('hide_when_full', hideFull ? 'on' : '');
+    fetch('/api/admin/node/save', {method:'POST', body:form})
+    .then(r=>r.json()).then(d=>{
+        if(d.success){ showCenterNotice('Đã lưu cấu hình node thành công!', false, 1500, ()=>location.reload()); }
+        else { showCenterNotice(d.error || 'Lỗi lưu cấu hình!', true); }
     }).catch(()=>showCenterNotice('Không thể kết nối máy chủ!', true));
 }
 
@@ -4056,7 +5032,7 @@ def my_vms():
             unit_labels = {"minutely": "phút", "hourly": "giờ", "daily": "ngày", "weekly": "tuần", "monthly": "tháng"}
             billing_text = f"{duration} {unit_labels.get(billing, billing)}"
             expiry = vm.get("expiry_time", "")
-            expiry_text = "Không giới hạn"
+            expiry_text = "Chưa tính giờ"
             is_expired = False
             if expiry:
                 try:
@@ -4084,7 +5060,11 @@ def my_vms():
                 "expiry_time": expiry,
                 "is_expired": is_expired,
                 "config": vm.get("config", {}),
-                "logs_locked": vm.get("logs_locked", settings.get("default_logs_locked", True))
+                "logs_locked": vm.get("logs_locked", settings.get("default_logs_locked", True)),
+                "rdp_tunnel_enabled": vm.get("rdp_tunnel_enabled", False),
+                "rdp_tunnel_auto": vm.get("rdp_tunnel_auto", False),
+                "rdp_tunnel_url": vm.get("rdp_tunnel_url", ""),
+                "rdp_mode": vm.get("rdp_mode", "tailscale")
             })
     nodes = get_nodes()
     for vm in user_vms:
@@ -4203,7 +5183,53 @@ def admin_panel():
             })
     nodes = get_nodes()
     for node_id, node in nodes.items():
-        node["_status"] = get_node_status(node)
+        if node_id == "local" or node.get("type") == "local":
+            node["_status"] = get_local_system_info()
+        else:
+            node["_status"] = get_node_status(node)
+        vm_count, user_list = get_node_vm_count(node_id)
+        node["_vm_count"] = vm_count
+        node["_vm_users"] = user_list
+
+    # === FIX: Chuẩn bị dữ liệu JSON cho JS trong Admin Template ===
+    nodes_for_js = {}
+    for node_id, node in nodes.items():
+        nodes_for_js[node_id] = {
+            "name": node.get("name", node_id),
+            "host": node.get("host", ""),
+            "port": node.get("port", WORKER_PORT),
+            "type": node.get("type", "worker"),
+            "enabled": node.get("enabled", True),
+            "tunnel_url": node.get("tunnel_url", ""),
+            "max_vms": node.get("max_vms", 0),
+            "auto_lock": node.get("auto_lock", True),
+            "locked": node.get("locked", False),
+            "lock_reason": node.get("lock_reason", ""),
+            "hide_when_full": node.get("hide_when_full", False),
+            "_status": node.get("_status", {}),
+            "_vm_count": node.get("_vm_count", 0),
+            "_vm_users": node.get("_vm_users", [])
+        }
+
+    vms_for_js = {node_id: [] for node_id in nodes}
+    for uid, u in users.items():
+        user_vms = get_user_vms(uid)
+        for vid, vm in user_vms.items():
+            nid = vm.get("node_id", "local")
+            if nid not in vms_for_js:
+                vms_for_js[nid] = []
+            vms_for_js[nid].append({
+                "vm_id": vid,
+                "vm_name": vm.get("name", "VM"),
+                "username": u.get("username", "Unknown"),
+                "status": vm.get("status", "stopped"),
+                "cpu": vm.get("config", {}).get("cpu", 2),
+                "ram": vm.get("config", {}).get("ram", 4),
+                "disk": vm.get("config", {}).get("disk", 50),
+                "expiry_time": vm.get("expiry_time", "")
+            })
+    # === END FIX ===
+
     return render_template_string(
         ADMIN_PAGE,
         username=user["username"],
@@ -4215,9 +5241,10 @@ def admin_panel():
         os_images=get_windows_images(),
         settings=settings,
         all_vms=all_vms,
-        nodes=nodes
+        nodes=nodes,
+        nodes_for_js=nodes_for_js,
+        vms_for_js=vms_for_js
     )
-
 # ==================== API ENDPOINTS ====================
 
 @app.route("/api/vm/create", methods=["POST"])
@@ -4229,6 +5256,7 @@ def api_create_vm():
     config_key = request.form.get("config", "").strip()
     os_key = request.form.get("windows", "").strip()
     tailscale_key = request.form.get("tailscale_key", "").strip()
+    rdp_mode = request.form.get("rdp_mode", "tailscale").strip()
     billing_cycle = request.form.get("billing_cycle", "monthly").strip()
     try:
         duration = max(1, int(request.form.get("duration", 1)))
@@ -4237,12 +5265,20 @@ def api_create_vm():
     node_id = request.form.get("node_id", "local").strip()
     if billing_cycle not in ("minutely", "hourly", "daily", "weekly", "monthly"):
         billing_cycle = "monthly"
-    if not vm_name or not config_key or not os_key or not tailscale_key:
-        return jsonify({"success": False, "error": "Vui lòng điền đầy đủ thông tin cấu hình và Tailscale Key."})
+    if not vm_name or not config_key or not os_key:
+        return jsonify({"success": False, "error": "Vui lòng điền đầy đủ thông tin cấu hình."})
+    if rdp_mode not in ("tailscale", "rdp1h"):
+        return jsonify({"success": False, "error": "Chế độ kết nối không hợp lệ."})
+    if rdp_mode == "tailscale" and not tailscale_key:
+        return jsonify({"success": False, "error": "Vui lòng nhập Tailscale Auth Key."})
+    if rdp_mode == "rdp1h":
+        tailscale_key = ""
     configs = get_vm_configs()
     if config_key not in configs:
         return jsonify({"success": False, "error": "Cấu hình VPS không hợp lệ."})
     cfg = configs[config_key]
+    if billing_cycle in cfg.get("disabled_cycles", []):
+        return jsonify({"success": False, "error": f"Chu kỳ '{billing_cycle}' đã bị khóa cho cấu hình {cfg['name']}. Vui lòng chọn chu kỳ khác."})
     images = get_windows_images()
     if os_key not in images:
         return jsonify({"success": False, "error": "Hệ điều hành không hợp lệ."})
@@ -4255,13 +5291,17 @@ def api_create_vm():
     if node_id not in nodes or not nodes[node_id].get("enabled", True):
         return jsonify({"success": False, "error": "Server được chọn không hợp lệ hoặc đang tắt."})
     node = nodes[node_id]
+    # Kiểm tra node capacity trước khi tạo
+    ok, err_msg, _ = check_node_capacity(node, cfg, node_id)
+    if not ok:
+        return jsonify({"success": False, "error": err_msg})
     users = load_all_users()
     if user["id"] in users:
         users[user["id"]]["balance"] -= price
         save_user(user["id"], users[user["id"]])
     vid = str(uuid.uuid4())[:8]
     vm_dir = get_user_vm_dir(user["id"], vid)
-    expiry = calculate_expiry(billing_cycle, duration).isoformat()
+    # expiry = calculate_expiry(billing_cycle, duration).isoformat()
     vm_data = {
         "id": vid,
         "user_id": user["id"],
@@ -4270,18 +5310,22 @@ def api_create_vm():
         "windows": win_img,
         "windows_key": os_key,
         "status": "creating",
-        "tailscale_key": tailscale_key,
+        "tailscale_key": tailscale_key if rdp_mode == "tailscale" else "",
         "tailscale_ip": None,
+        "rdp_mode": rdp_mode,
+        "rdp_tunnel_enabled": (rdp_mode == "rdp1h"),
+        "rdp_tunnel_auto": True,
+        "rdp_tunnel_url": None,
         "billing_cycle": billing_cycle,
         "duration": duration,
-        "expiry_time": expiry,
+        "expiry_time": "",
         "logs_locked": get_settings().get("default_logs_locked", True),
         "node_id": node_id,
         "created_at": datetime.now().isoformat()
     }
     save_vm_data(user["id"], vid, vm_data)
     if node_id == "local" or node.get("type") == "local":
-        t = threading.Thread(target=run_winbox_script, args=(user["id"], vid, cfg, win_img, tailscale_key, vm_name, os_key))
+        t = threading.Thread(target=run_winbox_script, args=(user["id"], vid, cfg, win_img, tailscale_key, vm_name, os_key, rdp_mode))
         t.daemon = True
         t.start()
     else:
@@ -4293,7 +5337,9 @@ def api_create_vm():
             "config": json.dumps(cfg),
             "windows_key": os_key,
             "tailscale_key": tailscale_key,
-            "billing_cycle": billing_cycle
+            "rdp_mode": rdp_mode,
+            "billing_cycle": billing_cycle,
+            "duration": duration
         }
         t = threading.Thread(target=lambda: worker_request(node, "/worker/create-vm", data=worker_data))
         t.daemon = True
@@ -4319,12 +5365,12 @@ def api_start_vm(vid):
             "vm_name": vm_data.get("name", "VM"),
             "config": json.dumps(vm_data.get("config", {})),
             "windows_key": vm_data.get("windows_key", "win11"),
-            "tailscale_key": vm_data.get("tailscale_key", "")
+            "tailscale_key": vm_data.get("tailscale_key", ""),
+            "rdp_mode": vm_data.get("rdp_mode", "tailscale")
         }
         resp = worker_request(node, "/worker/start-vm", data=worker_data)
         if resp.get("success"):
-            vm_data["status"] = "running"
-            save_vm_data(user["id"], vid, vm_data)
+            # Worker tự chuyển sang running sau khi QEMU + tunnel/auth đã READY.
             return jsonify({"success": True, "message": f"Đã phát lệnh bật VM trên {node.get('name', node_id)}."})
         else:
             return jsonify({"success": False, "error": resp.get("error", "Worker lỗi")})
@@ -4337,7 +5383,8 @@ def api_start_vm(vid):
             vm_dir,
             vm_data.get("name", "VM"),
             vm_data.get("windows_key", "win11"),
-            vm_data.get("tailscale_key", "")
+            vm_data.get("tailscale_key", ""),
+            vm_data.get("rdp_mode", "tailscale")
         )
         if ok:
             return jsonify({"success": True, "message": msg})
@@ -4345,7 +5392,7 @@ def api_start_vm(vid):
             return jsonify({"success": False, "error": msg})
     else:
         win_key = vm_data.get("windows_key", "win11")
-        t = threading.Thread(target=run_winbox_script, args=(user["id"], vid, vm_data.get("config"), vm_data.get("windows"), vm_data.get("tailscale_key"), vm_data.get("name"), win_key))
+        t = threading.Thread(target=run_winbox_script, args=(user["id"], vid, vm_data.get("config"), vm_data.get("windows"), vm_data.get("tailscale_key"), vm_data.get("name"), win_key, vm_data.get("rdp_mode", "tailscale")))
         t.daemon = True
         t.start()
         return jsonify({"success": True, "message": "Đang tải và khởi tạo lại máy ảo..."})
@@ -4424,12 +5471,78 @@ def api_renew_vm(vid):
     if user["id"] in users:
         users[user["id"]]["balance"] -= price
         save_user(user["id"], users[user["id"]])
-    new_expiry = calculate_expiry(billing_cycle, duration).isoformat()
+    old_expiry_str = vm_data.get("expiry_time", "")
+    try:
+        if old_expiry_str:
+            base = datetime.fromisoformat(old_expiry_str)
+            if base < datetime.now():
+                base = datetime.now()
+        else:
+            base = datetime.now()
+    except Exception:
+        base = datetime.now()
+    new_expiry = calculate_expiry(billing_cycle, duration, base).isoformat()
+    was_expired_stop = vm_data.get("status") == "stopped" and vm_data.get("stopped_reason") == "expired"
+
     vm_data["billing_cycle"] = billing_cycle
     vm_data["duration"] = duration
     vm_data["expiry_time"] = new_expiry
+    vm_data["stopped_reason"] = ""
     save_vm_data(user["id"], vid, vm_data)
     append_vm_log(user["id"], vid, f"[GIA HẠN] User gia hạn thêm {duration} x {billing_cycle}. Hết hạn mới: {new_expiry[:16]}")
+
+    # Nếu VM bị dừng do hết hạn thì gia hạn xong tự bật lại.
+    if was_expired_stop:
+        node_id = vm_data.get("node_id", "local")
+        nodes = get_nodes()
+        node = nodes.get(node_id)
+        try:
+            if node_id != "local" and node:
+                worker_data = {
+                    "user_id": user["id"],
+                    "vm_id": vid,
+                    "vm_name": vm_data.get("name", "VM"),
+                    "config": json.dumps(vm_data.get("config", {})),
+                    "windows_key": vm_data.get("windows_key", "win11"),
+                    "tailscale_key": vm_data.get("tailscale_key", ""),
+                    "rdp_mode": vm_data.get("rdp_mode", "tailscale")
+                }
+                resp = worker_request(node, "/worker/start-vm", data=worker_data)
+                if not resp.get("success"):
+                    append_vm_log(user["id"], vid, f"[GIA HẠN] Gia hạn xong nhưng bật lại VM thất bại: {resp.get('error', 'Worker lỗi')}")
+            else:
+                vm_dir = get_user_vm_dir(user["id"], vid)
+                win_img_path = vm_dir / "win.img"
+                if win_img_path.exists():
+                    ok, msg = start_vm_existing(
+                        user["id"], vid,
+                        vm_data.get("config", {}),
+                        vm_dir,
+                        vm_data.get("name", "VM"),
+                        vm_data.get("windows_key", "win11"),
+                        vm_data.get("tailscale_key", ""),
+                        vm_data.get("rdp_mode", "tailscale")
+                    )
+                    if not ok:
+                        append_vm_log(user["id"], vid, f"[GIA HẠN] Gia hạn xong nhưng bật lại VM thất bại: {msg}")
+                else:
+                    t = threading.Thread(
+                        target=run_winbox_script,
+                        args=(
+                            user["id"], vid,
+                            vm_data.get("config", {}),
+                            vm_data.get("windows", {}),
+                            vm_data.get("tailscale_key", ""),
+                            vm_data.get("name", "VM"),
+                            vm_data.get("windows_key", "win11"),
+                            vm_data.get("rdp_mode", "tailscale")
+                        ),
+                        daemon=True
+                    )
+                    t.start()
+        except Exception as e:
+            append_vm_log(user["id"], vid, f"[GIA HẠN] Lỗi tự bật lại VM: {e}")
+
     return jsonify({"success": True, "message": f"Gia hạn thành công! Hết hạn mới: {new_expiry[:16].replace('T', ' ')}"})
 
 
@@ -4451,8 +5564,67 @@ def api_vm_info(vid):
             "price_weekly": cfg.get("price_weekly", 0),
             "price_monthly": cfg.get("price_monthly", 0)
         },
-        "expiry_time": vm_data.get("expiry_time", "")
+        "expiry_time": vm_data.get("expiry_time", ""),
+        "rdp_tunnel_enabled": vm_data.get("rdp_tunnel_enabled", False),
+        "rdp_tunnel_auto": vm_data.get("rdp_tunnel_auto", False),
+        "rdp_tunnel_url": vm_data.get("rdp_tunnel_url", ""),
+        "rdp_mode": vm_data.get("rdp_mode", "tailscale"),
+        "rdp_tunnel_host": vm_data.get("rdp_tunnel_host", ""),
+        "rdp_tunnel_port": vm_data.get("rdp_tunnel_port", 0)
     })
+
+@app.route("/api/node/check-capacity", methods=["POST"])
+def api_check_node_capacity():
+    if not is_logged_in():
+        return jsonify({"success": False, "error": "Chưa đăng nhập"})
+    config_key = request.form.get("config_key", "").strip()
+    configs = get_vm_configs()
+    if config_key not in configs:
+        return jsonify({"success": False, "error": "Cấu hình không hợp lệ"})
+    cfg = configs[config_key]
+    nodes = get_nodes()
+    result = {}
+    for node_id, node in nodes.items():
+        if not node.get("enabled", True):
+            result[node_id] = {"ok": False, "reason": "Node đang tắt"}
+            continue
+        ok, err_msg, status = check_node_capacity(node, cfg, node_id)
+        result[node_id] = {"ok": ok, "reason": err_msg, "status": status}
+    return jsonify({"success": True, "nodes": result})
+
+@app.route("/api/vm/<vid>/rdp-refresh", methods=["POST"])
+def api_rdp_refresh(vid):
+    if not is_logged_in():
+        return jsonify({"success": False, "error": "Chưa đăng nhập"})
+    user = get_current_user()
+    vm_data = get_vm_data(user["id"], vid)
+    if not vm_data or vm_data.get("user_id") != user["id"]:
+        return jsonify({"success": False, "error": "Không tìm thấy máy ảo."})
+    if not vm_data.get("rdp_tunnel_enabled"):
+        return jsonify({"success": False, "error": "VM này không bật RDP 1h."})
+    with vm_lock:
+        if vid in active_vms and active_vms[vid].get("rdp_process"):
+            try:
+                active_vms[vid]["rdp_process"].terminate()
+            except Exception:
+                pass
+    vm_dir = get_user_vm_dir(user["id"], vid)
+    t = threading.Thread(target=_rdp_tunnel_worker, args=(user["id"], vid, vm_dir), daemon=True)
+    t.start()
+    return jsonify({"success": True, "message": "Đang khởi động lại RDP tunnel..."})
+
+@app.route("/api/vm/<vid>/rdp-toggle-auto", methods=["POST"])
+def api_rdp_toggle_auto(vid):
+    if not is_logged_in():
+        return jsonify({"success": False, "error": "Chưa đăng nhập"})
+    user = get_current_user()
+    vm_data = get_vm_data(user["id"], vid)
+    if not vm_data or vm_data.get("user_id") != user["id"]:
+        return jsonify({"success": False, "error": "Không tìm thấy máy ảo."})
+    auto = request.form.get("auto", "0") == "1"
+    vm_data["rdp_tunnel_auto"] = auto
+    save_vm_data(user["id"], vid, vm_data)
+    return jsonify({"success": True, "auto": auto})
 
 @app.route("/vm/<vid>/logs")
 def vm_logs_page(vid):
@@ -4809,6 +5981,12 @@ def api_admin_config_save():
         return jsonify({"success": False, "error": "Mã cấu hình đã tồn tại."})
     if original_key and original_key not in configs:
         return jsonify({"success": False, "error": "Không tìm thấy cấu hình cần sửa."})
+    disabled_cycles = []
+    if request.form.get("disable_minutely"): disabled_cycles.append("minutely")
+    if request.form.get("disable_hourly"): disabled_cycles.append("hourly")
+    if request.form.get("disable_daily"): disabled_cycles.append("daily")
+    if request.form.get("disable_weekly"): disabled_cycles.append("weekly")
+    if request.form.get("disable_monthly"): disabled_cycles.append("monthly")
     cfg = dict(configs.get(target_key, {}))
     cfg.update({
         "name": name,
@@ -4819,7 +5997,8 @@ def api_admin_config_save():
         "price_hourly": price_hourly,
         "price_daily": price_daily,
         "price_weekly": price_weekly,
-        "price_monthly": price_monthly
+        "price_monthly": price_monthly,
+        "disabled_cycles": disabled_cycles
     })
     configs[target_key] = cfg
     save_json(CONFIGS_FILE, configs)
@@ -5047,14 +6226,29 @@ def api_admin_node_save():
         port = int(port)
     except ValueError:
         port = WORKER_PORT
+    try:
+        max_vms = int(request.form.get("max_vms", 0))
+        if max_vms < 0: max_vms = 0
+    except (ValueError, TypeError):
+        max_vms = 0
+    auto_lock = request.form.get("auto_lock") == "on"
     nodes = get_nodes()
+    # Giữ lại trạng thái locked nếu node đã tồn tại
+    existing_locked = nodes.get(node_id, {}).get("locked", False)
+    existing_lock_reason = nodes.get(node_id, {}).get("lock_reason", "")
+    hide_when_full = request.form.get("hide_when_full") == "on"
     node_data = {
         "name": name,
         "host": host,
         "port": port,
         "type": "worker",
         "enabled": enabled,
-        "token": token
+        "token": token,
+        "max_vms": max_vms,
+        "auto_lock": auto_lock,
+        "locked": existing_locked,
+        "lock_reason": existing_lock_reason,
+        "hide_when_full": hide_when_full
     }
     if tunnel_url:
         node_data["tunnel_url"] = tunnel_url
@@ -5091,6 +6285,24 @@ def api_admin_node_test():
     else:
         return jsonify({"success": False, "error": f"Không thể kết nối đến {node['name']} ({node['host']}:{node['port']})."})
 
+@app.route("/api/admin/node/toggle-lock", methods=["POST"])
+def api_admin_node_toggle_lock():
+    if not is_admin():
+        return jsonify({"success": False, "error": "Unauthorized"})
+    node_id = request.form.get("node_id", "").strip()
+    lock = request.form.get("lock", "1") == "1"
+    nodes = get_nodes()
+    if node_id not in nodes:
+        return jsonify({"success": False, "error": "Node không tồn tại."})
+    nodes[node_id]["locked"] = lock
+    if lock:
+        nodes[node_id]["lock_reason"] = "Khóa thủ công bởi Admin"
+    else:
+        nodes[node_id]["lock_reason"] = ""
+    save_nodes(nodes)
+    return jsonify({"success": True, "locked": lock})
+
+
 @app.route("/api/worker/register", methods=["POST"])
 def api_worker_register():
     """Worker tự đăng ký với Master, dùng worker token để xác thực."""
@@ -5119,6 +6331,12 @@ def api_worker_register():
     }
     if tunnel_url:
         node_data["tunnel_url"] = tunnel_url
+    # Giữ lại cấu hình giới hạn nếu node đã tồn tại
+    existing = nodes.get(node_id, {})
+    node_data["max_vms"] = existing.get("max_vms", 0)
+    node_data["auto_lock"] = existing.get("auto_lock", True)
+    node_data["locked"] = existing.get("locked", False)
+    node_data["lock_reason"] = existing.get("lock_reason", "")
     nodes[node_id] = node_data
     save_nodes(nodes)
     return jsonify({"success": True, "message": "Worker đã đăng ký thành công."})
@@ -5257,9 +6475,19 @@ def worker_create_vm():
     config_json = request.form.get("config", "{}")
     windows_key = request.form.get("windows_key", "win11").strip()
     tailscale_key = request.form.get("tailscale_key", "").strip()
+    rdp_mode = request.form.get("rdp_mode", "tailscale").strip()
     billing_cycle = request.form.get("billing_cycle", "monthly").strip()
-    if billing_cycle not in ("hourly", "daily", "monthly"):
-        billing_cycle = "monthly"
+    try:
+        duration = max(1, int(request.form.get("duration", 1)))
+    except (ValueError, TypeError):
+        duration = 1
+
+    if rdp_mode not in ("tailscale", "rdp1h"):
+        rdp_mode = "tailscale"
+    if rdp_mode == "tailscale" and not tailscale_key:
+        return jsonify({"success": False, "error": "Thiếu Tailscale Auth Key."})
+    if rdp_mode == "rdp1h":
+        tailscale_key = ""
     try:
         config = json.loads(config_json)
     except Exception:
@@ -5267,7 +6495,7 @@ def worker_create_vm():
     images = get_windows_images()
     win_img = images.get(windows_key, list(images.values())[0])
     vm_dir = get_user_vm_dir(user_id, vm_id)
-    expiry = calculate_expiry(billing_cycle, duration).isoformat()
+    # expiry = calculate_expiry(billing_cycle, duration).isoformat()
     vm_data = {
         "id": vm_id,
         "user_id": user_id,
@@ -5276,17 +6504,25 @@ def worker_create_vm():
         "windows": win_img,
         "windows_key": windows_key,
         "status": "creating",
-        "tailscale_key": tailscale_key,
+        "tailscale_key": tailscale_key if rdp_mode == "tailscale" else "",
         "tailscale_ip": None,
+        "rdp_mode": rdp_mode,
+        "rdp_tunnel_enabled": (rdp_mode == "rdp1h"),
+        "rdp_tunnel_auto": True,
+        "rdp_tunnel_url": None,
         "billing_cycle": billing_cycle,
         "duration": duration,
-        "expiry_time": expiry,
+        "expiry_time": "",
+        "rdp_tunnel_enabled": (rdp_mode == "rdp1h"),
+        "rdp_tunnel_auto": True,
+        "rdp_tunnel_url": None,
+        "rdp_mode": rdp_mode,
         "logs_locked": True,
         "node_id": "local",
         "created_at": datetime.now().isoformat()
     }
     save_vm_data(user_id, vm_id, vm_data)
-    t = threading.Thread(target=run_winbox_script, args=(user_id, vm_id, config, win_img, tailscale_key, vm_name, windows_key))
+    t = threading.Thread(target=run_winbox_script, args=(user_id, vm_id, config, win_img, tailscale_key, vm_name, windows_key, rdp_mode))
     t.daemon = True
     t.start()
     return jsonify({"success": True, "message": "Worker đang khởi tạo VM..."})
@@ -5302,6 +6538,11 @@ def worker_start_vm():
     config_json = request.form.get("config", "{}")
     windows_key = request.form.get("windows_key", "win11").strip()
     tailscale_key = request.form.get("tailscale_key", "").strip()
+    rdp_mode = request.form.get("rdp_mode", "tailscale").strip()
+    if rdp_mode not in ("tailscale", "rdp1h"):
+        rdp_mode = "tailscale"
+    if rdp_mode == "rdp1h":
+        tailscale_key = ""
     try:
         config = json.loads(config_json)
     except Exception:
@@ -5309,18 +6550,19 @@ def worker_start_vm():
     vm_dir = get_user_vm_dir(user_id, vm_id)
     win_img_path = vm_dir / "win.img"
     if win_img_path.exists():
-        ok, msg = start_vm_existing(user_id, vm_id, config, vm_dir, vm_name, windows_key, tailscale_key)
+        ok, msg = start_vm_existing(user_id, vm_id, config, vm_dir, vm_name, windows_key, tailscale_key, rdp_mode)
     else:
         images = get_windows_images()
         win_img = images.get(windows_key, list(images.values())[0])
-        t = threading.Thread(target=run_winbox_script, args=(user_id, vm_id, config, win_img, tailscale_key, vm_name, windows_key))
+        t = threading.Thread(target=run_winbox_script, args=(user_id, vm_id, config, win_img, tailscale_key, vm_name, windows_key, rdp_mode))
         t.daemon = True
         t.start()
         ok, msg = True, "Đang tải và khởi tạo lại máy ảo..."
     if ok:
         vm_data = get_vm_data(user_id, vm_id)
         if vm_data:
-            vm_data["status"] = "running"
+            # start_vm_existing/run_winbox_script đã xác nhận QEMU READY
+            # trước khi chuyển sang running.
             save_vm_data(user_id, vm_id, vm_data)
         return jsonify({"success": True, "message": msg})
     return jsonify({"success": False, "error": msg})
@@ -5383,19 +6625,33 @@ def worker_status():
         cpu = psutil.cpu_percent(interval=0.5)
         mem = psutil.virtual_memory()
         disk = psutil.disk_usage("/")
+        boot_time = psutil.boot_time()
+        uptime_seconds = time.time() - boot_time
+        hours = int(uptime_seconds // 3600)
+        minutes = int((uptime_seconds % 3600) // 60)
         return jsonify({
             "success": True,
             "online": True,
+            "os": platform.system(),
+            "os_version": platform.release(),
+            "hostname": platform.node(),
+            "cpu_cores": psutil.cpu_count(logical=False) or 0,
+            "cpu_threads": psutil.cpu_count(logical=True) or 0,
             "cpu_percent": cpu,
             "ram_used_gb": round(mem.used / (1024**3), 2),
             "ram_total_gb": round(mem.total / (1024**3), 2),
+            "ram_free_gb": round((mem.total - mem.used) / (1024**3), 2),
             "ram_percent": mem.percent,
             "disk_used_gb": round(disk.used / (1024**3), 2),
             "disk_total_gb": round(disk.total / (1024**3), 2),
-            "disk_percent": disk.percent
+            "disk_free_gb": round((disk.total - disk.used) / (1024**3), 2),
+            "disk_percent": disk.percent,
+            "uptime": f"{hours}h {minutes}m"
         })
     except ImportError:
         return jsonify({"success": True, "online": True, "note": "psutil not installed"})
+    except Exception as e:
+        return jsonify({"success": False, "online": False, "error": str(e)})
 
 # ==================== WORKER AUTO SETUP ====================
 def get_local_ip():
@@ -5538,25 +6794,27 @@ if __name__ == "__main__":
     choice = input("  Chọn mode (1/2) [mặc định: 1]: ").strip()
     if choice == "2":
         # WORKER MODE
-        init_default_admin()
         print("\n[WORKER] Khởi động Worker Node...")
         print("=" * 65)
-        print("[WORKER] Bạn có thể nhập Tunnel URL sẵn hoặc để trống để tự động tạo.")
-        manual_tunnel = input("  Nhập Tunnel URL (để trống = tự tạo): ").strip()
-        master_url = input("  Nhập Master URL (để trống nếu tự thêm tay): ").strip()
 
+        # Tự động random toàn bộ thông tin
         node_name = f"Worker-{secrets.token_hex(3).upper()}"
         local_ip = get_local_ip()
-        tunnel_url = manual_tunnel
+        node_id = f"worker_{secrets.token_hex(4)}"
+
+        # Chỉ hỏi Tunnel URL và Master URL
+        tunnel_url = input("  📋 Dán Tunnel URL (Cloudflare/ngrok...): ").strip()
+        master_url = input("  🔗 Master URL (để trống nếu tự thêm tay): ").strip()
         tunnel_proc = None
 
+        # Nếu không dán link, tự động tạo tunnel
         if not tunnel_url:
+            print("[WORKER] Không có link → Đang tự tạo Cloudflare Tunnel...")
             tunnel_url, tunnel_proc = start_worker_tunnel(WORKER_PORT)
             if not tunnel_url:
-                print("[WORKER] Không thể tạo tunnel tự động. Bạn cần cung cấp Tunnel URL thủ công.")
-                tunnel_url = input("  Nhập Tunnel URL thủ công: ").strip()
+                print("[WORKER] ❌ Không thể tạo tunnel tự động.")
+                tunnel_url = input("  📋 Dán Tunnel URL thủ công: ").strip()
 
-        node_id = f"worker_{secrets.token_hex(4)}"
         node_info = {
             "node_id": node_id,
             "name": node_name,
@@ -5567,7 +6825,7 @@ if __name__ == "__main__":
         }
 
         print("\n" + "=" * 65)
-        print("  THÔNG TIN WORKER NODE (Copy vào Admin Panel nếu cần)")
+        print("  ✅ THÔNG TIN WORKER NODE")
         print("=" * 65)
         print(f"  Node ID   : {node_id}")
         print(f"  Name      : {node_name}")
@@ -5581,12 +6839,12 @@ if __name__ == "__main__":
             print("[WORKER] Đang tự động đăng ký với Master...")
             reg = register_worker_to_master(master_url, node_info, tunnel_url)
             if reg.get("success"):
-                print("[WORKER] Đăng ký với Master thành công!")
+                print("[WORKER] ✅ Đăng ký với Master thành công!")
             else:
-                print(f"[WORKER] Đăng ký thất bại: {reg.get('error','Unknown error')}")
-                print("[WORKER] Vui lòng thêm node thủ công qua Admin Panel.")
+                print(f"[WORKER] ⚠️ Đăng ký thất bại: {reg.get('error','Unknown error')}")
+                print("[WORKER] Hãy thêm node thủ công qua Admin Panel.")
         else:
-            print("[WORKER] Hãy thêm node này vào Master qua Admin Panel (hoặc cung cấp Master URL lần sau).")
+            print("[WORKER] ℹ️ Hãy thêm node này vào Master qua Admin Panel nếu cần.")
         print("=" * 65)
 
         worker_app.run(host="0.0.0.0", port=WORKER_PORT, debug=False, use_reloader=False)
@@ -5599,6 +6857,10 @@ if __name__ == "__main__":
         cleanup_thread.start()
         expired_cleanup_thread = threading.Thread(target=expired_vm_cleanup_worker, daemon=True)
         expired_cleanup_thread.start()
+        expired_stop_thread = threading.Thread(target=expired_vm_stop_worker, daemon=True)
+        expired_stop_thread.start()
+        auto_lock_thread = threading.Thread(target=node_auto_lock_worker, daemon=True)
+        auto_lock_thread.start()
         tunnel_thread = threading.Thread(target=start_cloudflare_tunnel, args=(5000,), daemon=True)
         tunnel_thread.start()
         print("=" * 65)
