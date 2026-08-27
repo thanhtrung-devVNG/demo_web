@@ -12,14 +12,13 @@ ORIGINAL_PWD="$(pwd)"
 
 # ════════════════════════════════════════════════════════════════
 #  WINBOX
-#  QEMU: luôn dùng AppImage prebuilt tối ưu (-O3/LTO/native), cho CẢ
-#  root lẫn rootless mode — không còn build QEMU từ source.
-#  AppImage tự chứa qemu-system-x86_64, qemu-img, firmware, ROM, libraries
-#  Không cần sudo/apt/system-wide QEMU để chạy VM
-#  TCG hoạt động không cần /dev/kvm; KVM là optional acceleration
-#  aria2: static binary (primary, ~5s), fallback wget/curl
+#  Rootless: dùng QEMU AppImage prebuilt thay vì build libs/QEMU từ source
+#  aria2: static binary (primary, ~5s), fallback apt, fallback conda (chậm)
+#  Conda: CHỈ dùng làm fallback cuối (aria2 conda rất chậm, 5-20 phút)
+#  Fix: removed --user from pip install (virtualenv compatibility)
+#  KVM: Auto detect /dev/kvm → enable KVM acceleration if available
 #  NEW: CLI flags --auto --winXXXX để chạy hoàn toàn không tương tác
-#  NEW: Tự động skip tải AppImage nếu QEMU đã tồn tại (--rebuild để tải lại)
+#  NEW: Tự động skip build nếu QEMU đã tồn tại (--rebuild để build lại)
 #
 #  Cách dùng:
 #    bash winbox                          # chế độ interactive như cũ
@@ -53,122 +52,7 @@ _rl_warn() { echo -e "${Y}⚠${W}  $1"; }
 #  trong function) sẽ chạy trước khi hàm tồn tại → báo lỗi "không
 #  tìm thấy" dù binary thực ra vẫn có sẵn trên máy.
 # ════════════════════════════════════════════════════════════════
-_resolve_qemu_appimage() {
-    # SINGLE SOURCE OF TRUTH: ưu tiên AppImage QEMU 11.x
-    # 1. Biến môi trường
-    # 2. AppImage cạnh script (winboxes-stable)
-    # 3. User-space local/share và cache
-    # 4. Fallback AppImage download / build
-    local _app_dir=""
-    local _app_name=""
-    local _candidate=""
-    local _candidates=()
-
-    # 1. WINBOXES_QEMU_APPIMAGE từ môi trường
-    if [[ -n "${WINBOXES_QEMU_APPIMAGE:-}" && -x "${WINBOXES_QEMU_APPIMAGE}" ]]; then
-        echo "${WINBOXES_QEMU_APPIMAGE}"
-        return 0
-    fi
-
-    # 2. AppImage cạnh script hiện tại (winboxes-stable)
-    local _script_dir
-    _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo '.')" && pwd)"
-    for _nm in QEMU-11-*.AppImage QEMU-11.AppImage; do
-        if [[ -x "$_script_dir/$_nm" ]]; then
-            echo "$_script_dir/$_nm"
-            return 0
-        fi
-    done
-
-    # 3. User-space: $HOME/.local/share/winboxes/
-    local _user_share="$HOME/.local/share/winboxes"
-    mkdir -p "$_user_share"
-    for _nm in QEMU-11-*.AppImage QEMU-11.AppImage; do
-        _candidate="$_user_share/$_nm"
-        if [[ -x "$_candidate" ]]; then
-            echo "$_candidate"
-            return 0
-        fi
-    done
-
-    # 4. $HOME/.cache/winboxes/
-    local _user_cache="$HOME/.cache/winboxes"
-    mkdir -p "$_user_cache"
-    for _nm in QEMU-11-*.AppImage QEMU-11.AppImage; do
-        _candidate="$_user_cache/$_nm"
-        if [[ -x "$_candidate" ]]; then
-            echo "$_candidate"
-            return 0
-        fi
-    done
-
-    # 5. Fallback: tìm AppImage đã tải từ các vị trí khác
-    for _search_base in "$HOME/qemu-static/share/qemu-appimage" "/tmp"; do
-        if [[ -d "$_search_base" ]]; then
-            for _nm in QEMU-11-*.AppImage QEMU-11.AppImage; do
-                _candidate="$_search_base/$_nm"
-                if [[ -x "$_candidate" ]]; then
-                    echo "$_candidate"
-                    return 0
-                fi
-            done
-        fi
-    done
-
-    # 6. Fallback: tìm binary QEMU truyền thống (không phải AppImage)
-    for q in \
-        "${QEMU_BIN:-}" \
-        "$HOME/qemu-static/bin/qemu-system-x86_64" \
-        "$HOME/qemu-optimized/bin/qemu-system-x86_64" \
-        "/opt/qemu-optimized/bin/qemu-system-x86_64" \
-        "$(command -v qemu-system-x86_64 2>/dev/null || true)"; do
-        [[ -n "$q" && -x "$q" ]] && { echo "$q"; return 0; }
-    done
-
-    return 1
-}
-
-_resolve_qemu_appimage_img() {
-    local _appimage="${1:-}"
-    if [[ -z "$_appimage" ]]; then
-        _appimage="$(_resolve_qemu_appimage 2>/dev/null || echo '')"
-    fi
-    if [[ -n "$_appimage" && -x "$_appimage" ]]; then
-        # AppImage chứa qemu-img nội bộ; dùng --appimage-extract-and-run
-        echo "$_appimage"
-        return 0
-    fi
-    # Fallback: tìm qemu-img truyền thống
-    for qi in \
-        "$(dirname "${QEMU_BIN:-/nonexistent}" 2>/dev/null || echo '')/qemu-img" \
-        "${PREFIX:-}/bin/qemu-img" \
-        "$HOME/qemu-static/bin/qemu-img" \
-        "$HOME/qemu-optimized/bin/qemu-img" \
-        "/opt/qemu-optimized/bin/qemu-img" \
-        "/usr/bin/qemu-img" \
-        "$(command -v qemu-img 2>/dev/null || true)"; do
-        if [[ -n "$qi" && -x "$qi" ]]; then
-            if "$qi" --version >/dev/null 2>&1; then
-                echo "$qi"
-                return 0
-            fi
-        fi
-    done
-    return 1
-}
-
 _resolve_qemu_bin() {
-    local _appimg="$(_resolve_qemu_appimage 2>/dev/null || echo '')"
-    if [[ -n "$_appimg" && -x "$_appimg" ]]; then
-        # Trả về wrapper hoặc binary thực trong AppImage
-        if [[ "$_appimg" == *"AppImage"* ]]; then
-            echo "$_appimg"
-            return 0
-        else
-            echo "$_appimg"
-            return 0
-        fi
-    fi
     for q in \
         "${QEMU_BIN:-}" \
         "$HOME/qemu-static/bin/qemu-system-x86_64" \
@@ -176,30 +60,6 @@ _resolve_qemu_bin() {
         "/opt/qemu-optimized/bin/qemu-system-x86_64" \
         "$(command -v qemu-system-x86_64 2>/dev/null)"; do
         [[ -n "$q" && -x "$q" ]] && { echo "$q"; return 0; }
-    done
-    return 1
-}
-
-_resolve_qemu_img() {
-    local _appimg="$(_resolve_qemu_appimage 2>/dev/null || echo '')"
-    if [[ -n "$_appimg" && -x "$_appimg" ]]; then
-        echo "$_appimg"
-        return 0
-    fi
-    for qi in \
-        "$(dirname "${QEMU_BIN:-/nonexistent}")/qemu-img" \
-        "${PREFIX:-}/bin/qemu-img" \
-        "$HOME/qemu-static/bin/qemu-img" \
-        "$HOME/qemu-optimized/bin/qemu-img" \
-        "/opt/qemu-optimized/bin/qemu-img" \
-        "/usr/bin/qemu-img" \
-        "$(command -v qemu-img 2>/dev/null || true)"; do
-        if [[ -x "$qi" ]]; then
-            if "$qi" --version >/dev/null 2>&1; then
-                echo "$qi"
-                return 0
-            fi
-        fi
     done
     return 1
 }
@@ -226,13 +86,129 @@ _resolve_qemu_img() {
 }
 
 # ════════════════════════════════════════════════════════════════
-#  VM STOP — dừng QEMU an toàn qua QMP quit (flush đĩa/state đúng cách)
+#  PGO HELPERS
 # ════════════════════════════════════════════════════════════════
-_vm_stop() {
+_pgo_key_for_choice() {
+    case "${1:-}" in
+        1) echo "win2012pgo" ;;
+        2) echo "win2022pgo" ;;
+        3) echo "win11pgo" ;;
+        4) echo "win10ltsbpgo" ;;
+        5) echo "win10ltscpgo" ;;
+        6|*) echo "win10ltsb2022pgo" ;;
+    esac
+}
+_bolt_key_for_choice() {
+    case "${1:-}" in
+        1) echo "win2012bolt" ;;
+        2) echo "win2022bolt" ;;
+        3) echo "win11bolt" ;;
+        4) echo "win10ltsbbolt" ;;
+        5) echo "win10ltscbolt" ;;
+        6|*) echo "win10ltsb2022bolt" ;;
+    esac
+}
+
+
+_pgo_remote_url() {
+    # Trả về URL tải PGO profile từ xa (archive.org) cho từng key
+    case "${1:-}" in
+        win2012pgo)   echo "https://archive.org/download/win2012pgo.tar/win2012pgo.tar.gz" ;;
+        win2022pgo)   echo "https://archive.org/download/win2022pgo.tar/win2022pgo.tar.gz" ;;
+        win11pgo)     echo "https://archive.org/download/win11pgo.tar/win11pgo.tar.gz" ;;
+        win10ltsbpgo) echo "https://archive.org/download/win10ltsbpgo.tar/win10ltsbpgo.tar.gz" ;;
+        win10ltscpgo) echo "https://archive.org/download/win10ltscpgo.tar/win10ltscpgo.tar.gz" ;;
+        win10ltsb2022pgo) echo "https://archive.org/download/win10ltsb2022pgo.tar/win10ltsb2022pgo.tar.gz" ;;
+        *)            echo "" ;;
+    esac
+}
+
+_pgo_download_remote() {
+    # Tải PGO archive từ xa về $PGO_PROFILE_ARCHIVE
+    # Trả về 0 nếu tải thành công và archive hợp lệ
+    local _url; _url="$(_pgo_remote_url "$PGO_PROFILE_KEY")"
+    [[ -z "$_url" ]] && return 1
+
+    echo -e "${B}ℹ${W}  Tải PGO profile từ xa: ${_url}"
+    local _ok=0
+    if command -v aria2c &>/dev/null; then
+        aria2c "${ARIA2_OPTS[@]}" \
+            "$_url" -d "$PGO_PROFILE_ROOT" -o "${PGO_PROFILE_KEY}.tar.gz" \
+            >/dev/null 2>&1 && _ok=1
+    elif command -v wget &>/dev/null; then
+        wget -q --show-progress --continue \
+            "$_url" -O "$PGO_PROFILE_ARCHIVE" 2>&1 && _ok=1
+    elif command -v curl &>/dev/null; then
+        curl -fL --progress-bar \
+            "$_url" -o "$PGO_PROFILE_ARCHIVE" && _ok=1
+    fi
+
+    if [[ "$_ok" == "1" ]] \
+        && [[ -f "$PGO_PROFILE_ARCHIVE" ]] \
+        && [[ $(stat -c%s "$PGO_PROFILE_ARCHIVE" 2>/dev/null || echo 0) -gt 1024 ]] \
+        && tar -tzf "$PGO_PROFILE_ARCHIVE" >/dev/null 2>&1; then
+        echo -e "${G}✔${W}  PGO profile tải xong: $PGO_PROFILE_ARCHIVE"
+        return 0
+    else
+        echo -e "${Y}⚠${W}  Tải PGO profile thất bại hoặc archive không hợp lệ — sẽ generate lại"
+        rm -f "$PGO_PROFILE_ARCHIVE" 2>/dev/null || true
+        return 1
+    fi
+}
+
+_pgo_prepare_context() {
+    local _choice="${1:-5}"
+    PGO_PROFILE_ROOT="${WINBOX_PGO_DIR:-$ORIGINAL_PWD}"
+    mkdir -p "$PGO_PROFILE_ROOT"
+    PGO_PROFILE_KEY="$(_pgo_key_for_choice "$_choice")"
+    PGO_PROFILE_DIR="$PGO_PROFILE_ROOT/$PGO_PROFILE_KEY"
+    PGO_PROFILE_ARCHIVE="$PGO_PROFILE_ROOT/${PGO_PROFILE_KEY}.tar.gz"
+    PGO_PROFILE_READY=0
+    PGO_PROFILE_KIND="gcc"
+    PGO_LAUNCH_ENV=""
+
+    # Nếu chưa có archive local → thử tải từ archive.org
+    if [[ ! -f "$PGO_PROFILE_ARCHIVE" ]]; then
+        echo -e "${B}ℹ${W}  Không tìm thấy PGO archive local cho ${PGO_PROFILE_KEY} — thử tải từ xa..."
+        _pgo_download_remote || true  # thất bại thì tiếp tục → generate phase
+    fi
+
+    if [[ -f "$PGO_PROFILE_ARCHIVE" ]]; then
+        if [[ $(stat -c%s "$PGO_PROFILE_ARCHIVE" 2>/dev/null || echo 0) -gt 1024 ]] && tar -tzf "$PGO_PROFILE_ARCHIVE" >/dev/null 2>&1; then
+            rm -rf "$PGO_PROFILE_DIR"
+            if tar -xzf "$PGO_PROFILE_ARCHIVE" -C "$PGO_PROFILE_ROOT" >/dev/null 2>&1; then
+                PGO_PROFILE_READY=1
+            else
+                echo -e "${Y}⚠${W}  Không giải nén được PGO archive: $PGO_PROFILE_ARCHIVE"
+                rm -rf "$PGO_PROFILE_DIR"
+                PGO_PROFILE_READY=0
+            fi
+        else
+            echo -e "${Y}⚠${W}  PGO archive rỗng/corrupt, sẽ generate lại: $PGO_PROFILE_ARCHIVE"
+            rm -f "$PGO_PROFILE_ARCHIVE" 2>/dev/null || true
+            rm -rf "$PGO_PROFILE_DIR"
+        fi
+    fi
+}
+_bolt_prepare_context() {
+    local _choice="${1:-5}"
+    BOLT_PROFILE_KEY="$(_bolt_key_for_choice "$_choice")"
+    BOLT_PROFILE_DIR="${BOLT_PROFILE_ROOT}/${BOLT_PROFILE_KEY}"
+    BOLT_FDATA="${BOLT_PROFILE_DIR}/qemu-bolt.fdata"
+    BOLT_COMPLETE_MARKER="${BOLT_PROFILE_DIR}/.bolt-complete"
+    mkdir -p "$BOLT_PROFILE_DIR"
+    echo -e "${B}ℹ${W}  BOLT profile dir: ${BOLT_PROFILE_DIR}"
+}
+
+
+_pgo_stop_vm() {
     local _pid
     _pid=$(cat "$WINVM_PID_FILE" 2>/dev/null || echo "")
     if [[ -n "$_pid" ]] && kill -0 "$_pid" 2>/dev/null; then
-        # QMP 'quit' → QEMU tự exit đúng cách (KHÔNG dùng system_powerdown/kill -9)
+        # QMP 'quit' → QEMU tự exit, chạy atexit handlers → flush .gcda/.profraw / .fdata
+        # KHÔNG dùng system_powerdown: đó là ACPI signal cho Windows shutdown,
+        # QEMU vẫn cần được exit riêng mới flush được profile buffers.
+        # KHÔNG dùng kill -9: bypass atexit hoàn toàn → profile không được ghi.
         _qmp "quit" >/dev/null 2>&1 || true
         local _waited=0
         while kill -0 "$_pid" 2>/dev/null && [[ $_waited -lt 30 ]]; do
@@ -243,13 +219,468 @@ _vm_stop() {
             kill -TERM "$_pid" 2>/dev/null || true
             sleep 5
         fi
+        # Kill cứng chỉ là safety net — profile có thể không đầy đủ nếu đến đây
         if kill -0 "$_pid" 2>/dev/null; then
-            echo -e "${Y}⚠${W}  QEMU không tự exit — kill -9"
+            echo -e "${Y}⚠${W}  QEMU không tự exit — kill -9 (profile có thể bị thiếu)"
             kill -9 "$_pid" 2>/dev/null || true
         fi
     fi
-    sleep 2  # filesystem flush
-    _bootmon_stop || true  # Đảm bảo Boot Monitor dừng khi VM dừng
+    sleep 2  # filesystem flush (cả .gcda lẫn .fdata)
+    # BOLT finalize: merge fdata và apply nếu đang ở chế độ collect
+    # Đảm bảo BOLT context được set theo Windows OS hiện tại
+    [[ -z "${BOLT_PROFILE_KEY:-}" ]] && _bolt_prepare_context "${win_choice:-5}"
+    _bolt_finalize_after_vm || true
+}
+
+_pgo_finalize_profile() {
+    mkdir -p "$PGO_PROFILE_ROOT"
+    local _has_profile=0
+    if [[ "$PGO_PROFILE_KIND" == "clang" ]]; then
+        if compgen -G "$PGO_PROFILE_DIR/*.profraw" >/dev/null || [[ -f "$PGO_PROFILE_DIR/default.profdata" ]]; then
+            _has_profile=1
+        fi
+        if [[ $_has_profile -eq 1 ]] && command -v llvm-profdata &>/dev/null && compgen -G "$PGO_PROFILE_DIR/*.profraw" >/dev/null; then
+            llvm-profdata merge -o "$PGO_PROFILE_DIR/default.profdata" "$PGO_PROFILE_DIR"/*.profraw >/dev/null 2>&1 || true
+            _has_profile=1
+        fi
+    else
+        # compgen -G với ** không hoạt động khi globstar tắt (mặc định bash)
+        # find + wc -l an toàn hơn grep -q (tránh set -e kill pipe)
+        local _gcda_count
+        _gcda_count=$(find "$PGO_PROFILE_DIR" -type f -name '*.gcda' 2>/dev/null | wc -l || echo 0)
+        [[ "$_gcda_count" -gt 0 ]] && _has_profile=1
+    fi
+    if [[ "$_has_profile" -ne 1 ]]; then
+        echo -e "${R}✘${W} Không tìm thấy profile hợp lệ trong: $PGO_PROFILE_DIR"
+        echo -e "${Y}💡 Chạy lại workload nhẹ trong VM rồi thử continue lần nữa.${W}"
+        return 1
+    fi
+    rm -f "$PGO_PROFILE_ARCHIVE" 2>/dev/null || true
+    tar -czf "$PGO_PROFILE_ARCHIVE" -C "$PGO_PROFILE_ROOT" "$PGO_PROFILE_KEY" >/dev/null 2>&1 || {
+        echo -e "${R}✘${W} Không đóng gói được PGO archive: $PGO_PROFILE_ARCHIVE"
+        return 1
+    }
+    if [[ ! -s "$PGO_PROFILE_ARCHIVE" ]]; then
+        echo -e "${R}✘${W} PGO archive rỗng: $PGO_PROFILE_ARCHIVE"
+        return 1
+    fi
+    return 0
+}
+
+
+# ════════════════════════════════════════════════════════════════
+#  LLVM BOLT HELPERS
+#  BOLT chỉ hoạt động ở root mode (apt build).
+#  Rootless mode không bao giờ dùng BOLT.
+# ════════════════════════════════════════════════════════════════
+# Global BOLT state
+BOLT_MODE=0          # 0=off, 1=collecting profile, 2=applied
+BOLT_PROFILE_ROOT="/tmp/qemu-bolt-prof"
+BOLT_PROFILE_KEY=""   # e.g. "win11bolt", "win2012bolt" — per-OS BOLT profile
+BOLT_PROFILE_DIR=""   # "${BOLT_PROFILE_ROOT}/${BOLT_PROFILE_KEY}"
+BOLT_FDATA=""         # "${BOLT_PROFILE_DIR}/qemu-bolt.fdata"
+BOLT_ORIG_BIN=""     # path to original binary before instrumentation
+BOLT_INST_BIN=""     # path to instrumented binary
+BOLT_OPT_BIN=""      # path to BOLT-optimized binary
+BOLT_COMPLETE_MARKER=""  # "${BOLT_PROFILE_DIR}/.bolt-complete"
+
+# Danh sách version LLVM hỗ trợ BOLT, ưu tiên mới nhất → cũ nhất.
+# Không khoá cứng vào bolt-20 nữa — hỗ trợ mọi bản LLVM có đóng gói BOLT
+# (Ubuntu/Debian llvm-toolchain, apt.llvm.org, v.v.)
+BOLT_LLVM_VERSIONS=(21 20 19 18 17 16 15 14 13)
+
+# _bolt_find_tool <prefix>: tìm binary <prefix>-N theo BOLT_LLVM_VERSIONS,
+# rồi fallback binary không version, rồi cuối cùng quét PATH cho bất kỳ
+# <prefix>-<số> nào khác (để không bỏ sót các bản LLVM tương lai/lạ).
+_bolt_find_tool() {
+    local _prefix="$1" _v
+    for _v in "${BOLT_LLVM_VERSIONS[@]}"; do
+        command -v "${_prefix}-${_v}" &>/dev/null && { echo "${_prefix}-${_v}"; return 0; }
+    done
+    command -v "$_prefix" &>/dev/null && { echo "$_prefix"; return 0; }
+    # Fallback: quét PATH tìm biến thể version khác chưa liệt kê ở trên,
+    # chọn số hiệu cao nhất tìm được (sort -V để so sánh version đúng)
+    local _found
+    _found=$(compgen -c "${_prefix}-" 2>/dev/null \
+        | grep -E "^${_prefix}-[0-9]+$" \
+        | sort -t- -k3 -V -r \
+        | head -1)
+    if [[ -n "$_found" ]] && command -v "$_found" &>/dev/null; then
+        echo "$_found"; return 0
+    fi
+    echo ""
+    return 1
+}
+
+_bolt_check_tools() {
+    # LLVM BOLT chỉ được bật khi người dùng truyền cờ --llvm-bolt (BOLT_MODE=1)
+    # Không còn tự động kích hoạt chỉ vì có sẵn công cụ trên máy.
+    [[ "${BOLT_MODE:-0}" == "1" ]] || return 1
+    # Chỉ kích hoạt BOLT ở root mode, có apt
+    [[ "$APT_OK" != "1" ]] && return 1
+    # LLVM BOLT KHÔNG bao giờ dùng trong rootless mode
+    [[ "$ROOTLESS" == "1" ]] && return 1
+    # Tắt BOLT bằng biến môi trường
+    [[ "${NO_BOLT:-0}" == "1" ]] && return 1
+    # Kiểm tra llvm-bolt binary — bất kỳ version nào trong BOLT_LLVM_VERSIONS
+    # hoặc phát hiện được qua quét PATH
+    [[ -n "$(_bolt_find_tool llvm-bolt)" ]] || return 1
+    [[ -n "$(_bolt_find_tool merge-fdata)" ]] || return 1
+    return 0
+}
+
+_bolt_binary() {
+    _bolt_find_tool llvm-bolt
+}
+
+_bolt_merge_binary() {
+    _bolt_find_tool merge-fdata
+}
+
+_bolt_is_ready() {
+    # Trả về 0 nếu BOLT đã được áp dụng vào binary hiện tại và sẵn sàng dùng
+    # Kiểm tra marker cho profile key hiện tại (per-OS)
+    local _marker="${BOLT_COMPLETE_MARKER:-${BOLT_PROFILE_ROOT}/${BOLT_PROFILE_KEY:-default}/.bolt-complete}"
+    [[ -f "$_marker" ]] && return 0
+    return 1
+}
+
+# _bolt_ensure_runtime_lib: chế độ "-instrument" của llvm-bolt cần link với
+# runtime static lib libbolt_rt_instr.a. Trên nhiều bản Ubuntu/Debian, gói
+# apt cài lib này vào /usr/lib/llvm-<ver>/lib/ (hoặc thư mục target-specific)
+# chứ KHÔNG phải thẳng /usr/lib — trong khi llvm-bolt lại mặc định tìm ở
+# /usr/lib, gây lỗi "library not found: /usr/lib/libbolt_rt_instr.a".
+# Hàm này: (1) dò khắp các vị trí phổ biến, (2) nếu không thấy thì thử apt
+# install vài gói khả dĩ, (3) nếu tìm được mà không nằm ở /usr/lib thì tạo
+# symlink vào /usr/lib để llvm-bolt tìm thấy.
+_bolt_ensure_runtime_lib() {
+    local _libname="libbolt_rt_instr.a"
+    local _target="/usr/lib/${_libname}"
+    [[ -f "$_target" ]] && return 0
+
+    local _found
+    _found=$(find /usr/lib /usr/lib64 /usr/local/lib \
+                 /usr/lib/llvm-* /usr/lib/*/  \
+                 -maxdepth 5 -name "$_libname" -type f 2>/dev/null | head -1)
+
+    if [[ -z "$_found" ]]; then
+        # Thử cài gói cung cấp runtime BOLT — tên gói khác nhau tuỳ bản
+        # phân phối/repo, nên thử nhiều ứng viên cho từng version LLVM
+        local _bv
+        for _bv in "${BOLT_LLVM_VERSIONS[@]}"; do
+            command -v "llvm-bolt-${_bv}" &>/dev/null || continue
+            for _pkg in "libbolt-rt-${_bv}" "libbolt-${_bv}-dev" "llvm-${_bv}-dev" "libclang-rt-${_bv}-dev"; do
+                apt_install "$_pkg" &>/dev/null || true
+            done
+        done
+        _found=$(find /usr/lib /usr/lib64 /usr/local/lib \
+                     /usr/lib/llvm-* /usr/lib/*/ \
+                     -maxdepth 5 -name "$_libname" -type f 2>/dev/null | head -1)
+    fi
+
+    if [[ -n "$_found" ]]; then
+        if [[ "$_found" != "$_target" ]]; then
+            ln -sf "$_found" "$_target" 2>/dev/null \
+                || sudo ln -sf "$_found" "$_target" 2>/dev/null \
+                || cp -f "$_found" "$_target" 2>/dev/null \
+                || sudo cp -f "$_found" "$_target" 2>/dev/null || true
+        fi
+        [[ -f "$_target" ]] && return 0
+    fi
+    return 1
+}
+
+_bolt_prepare_instrumented() {
+    local _qemu_bin="$1"
+    [[ -z "$_qemu_bin" || ! -x "$_qemu_bin" ]] && return 1
+
+    # Đảm bảo BOLT context được set theo Windows OS (nếu chưa có)
+    if [[ -z "${BOLT_PROFILE_KEY:-}" ]]; then
+        _bolt_prepare_context "${win_choice:-5}"
+    fi
+
+    if ! _bolt_check_tools; then
+        echo -e "${Y}⚠${W}  LLVM BOLT: không đủ công cụ (cần llvm-bolt + merge-fdata, hỗ trợ LLVM 13-21, + root) — bỏ qua"
+        return 1
+    fi
+
+    echo ""
+    echo -e "${C}══════════════════════════════════════════════${W}"
+    echo -e "${C}⚡ LLVM BOLT — Instrumentation Mode${W}"
+    echo -e "${C}══════════════════════════════════════════════${W}"
+
+    mkdir -p "$BOLT_PROFILE_DIR"
+
+    # Nếu đã có BOLT marker → đã áp dụng rồi, skip
+    if _bolt_is_ready; then  # checks per-OS BOLT_COMPLETE_MARKER
+        echo -e "${G}✔${W}  BOLT đã được áp dụng cho binary hiện tại — bỏ qua"
+        BOLT_MODE=2
+        return 0
+    fi
+
+    # Kiểm tra xem binary có chứa relocation không (emit-relocs)
+    # Nếu binary không có relocation sections → BOLT không hoạt động
+    local _has_relocs=0
+    if readelf -S "$_qemu_bin" 2>/dev/null | grep -q "\.rela\.text\b"; then
+        _has_relocs=1
+    fi
+    if [[ "$_has_relocs" == "0" ]]; then
+        echo -e "${Y}⚠${W}  Binary không có relocation sections (.rela.text)"
+        echo -e "${Y}⚠${W}  Cần build lại với -Wl,--emit-relocs — bỏ qua BOLT lần này"
+        echo -e "${B}ℹ${W}  Build lần sau sẽ tự động thêm emit-relocs khi có BOLT"
+        return 1
+    fi
+
+    # Nếu đã có fdata từ lần chạy trước → apply luôn
+    local _fdata_files=()
+    local _fcount=0
+    if compgen -G "${BOLT_PROFILE_DIR}/${BOLT_PROFILE_KEY}*" >/dev/null 2>&1; then
+        while IFS= read -r -d '' _f; do
+            local _fsz; _fsz=$(stat -c%s "$_f" 2>/dev/null || echo 0)
+            [[ "$_fsz" -gt 100 ]] || continue
+            _fdata_files+=("$_f")
+            _fcount=$((_fcount + 1))
+        done < <(find "$BOLT_PROFILE_DIR" -maxdepth 1 \( -name "${BOLT_PROFILE_KEY}*" -o -name "*.fdata" \) -type f -print0 2>/dev/null)
+    fi
+
+    if [[ "$_fcount" -gt 0 ]]; then
+        echo -e "${G}✔${W}  Tìm thấy $_fcount fdata files — merge và apply BOLT"
+        _bolt_merge_and_apply "$_qemu_bin" "${_fdata_files[@]}"
+        return $?
+    fi
+
+    # Không có fdata → tạo instrumented binary để collect
+    local _bolt_bin; _bolt_bin="$(_bolt_binary)"
+    local _qemu_dir; _qemu_dir="$(dirname "$_qemu_bin")"
+    local _qemu_name; _qemu_name="$(basename "$_qemu_bin")"
+
+    BOLT_ORIG_BIN="$_qemu_bin"
+    BOLT_INST_BIN="${_qemu_dir}/.${_qemu_name}.bolt-inst"
+
+    echo -e "${B}ℹ${W}  Tạo instrumented binary để thu thập profile..."
+    echo -e "${B}ℹ${W}  Binary gốc:     ${BOLT_ORIG_BIN}${W}"
+    echo -e "${B}ℹ${W}  Instrumented:   ${BOLT_INST_BIN}${W}"
+
+    # Đảm bảo có libbolt_rt_instr.a trước khi instrument, nếu không sẽ
+    # thất bại với lỗi "library not found" khó hiểu
+    if ! _bolt_ensure_runtime_lib; then
+        echo -e "${Y}⚠${W}  Không tìm/cài được libbolt_rt_instr.a (BOLT runtime lib) — bỏ qua BOLT"
+        echo -e "${B}ℹ${W}  Thử cài thủ công: sudo apt install libbolt-rt-<version> (hoặc llvm-<version>-dev)"
+        return 1
+    fi
+
+    # Tạo instrumented binary với BOLT
+    if "$_bolt_bin" -instrument "$BOLT_ORIG_BIN" \
+        -o "$BOLT_INST_BIN" \
+        -instrumentation-file="${BOLT_PROFILE_DIR}/${BOLT_PROFILE_KEY}" \
+        -instrumentation-sleep-time=60 \
+        2>/tmp/bolt-instrument.log; then
+
+        # Kiểm tra BOLT có thực sự instrumentation chưa
+        local _inst_size; _inst_size=$(stat -c%s "$BOLT_INST_BIN" 2>/dev/null || echo 0)
+        if [[ "$_inst_size" -lt 1024 ]]; then
+            echo -e "${R}✘${W}  Instrumented binary quá nhỏ (${_inst_size} bytes) — BOLT instrumentation thất bại"
+            rm -f "$BOLT_INST_BIN" 2>/dev/null || true
+            return 1
+        fi
+
+        # Thay thế binary gốc bằng instrumented (để VM dùng)
+        # Backup binary gốc với tên .pre-bolt
+        cp -f "$BOLT_ORIG_BIN" "${BOLT_ORIG_BIN}.pre-bolt"
+        cp -f "$BOLT_INST_BIN" "$BOLT_ORIG_BIN"
+        chmod +x "$BOLT_ORIG_BIN"
+
+        # Đảm bảo libstdc++ có trong LD_LIBRARY_PATH cho instrumented binary
+        local _libstdcpp
+        _libstdcpp=$(find /usr/lib /lib -name "libstdc++.so.6" -type f 2>/dev/null | head -1)
+        if [[ -n "$_libstdcpp" ]]; then
+            local _libdir; _libdir="$(dirname "$_libstdcpp")"
+            export LD_LIBRARY_PATH="${_libdir}:${LD_LIBRARY_PATH:-}"
+        fi
+
+        BOLT_MODE=1
+        echo -e "${G}✔${W}  Instrumented binary đã sẵn sàng (${_inst_size} bytes)"
+        echo -e "${Y}⚠${W}  VM lần này sẽ chạy chậm hơn — đang thu thập BOLT profile"
+        echo -e "${B}ℹ${W}  Profile sẽ tự động ghi mỗi 60s vào: ${BOLT_PROFILE_DIR:-/tmp/qemu-bolt-prof}/${BOLT_PROFILE_KEY:-default}/"
+        echo -e "${B}ℹ${W}  Khi VM dừng, BOLT sẽ tự động merge và tối ưu binary"
+        return 0
+    else
+        echo -e "${R}✘${W}  BOLT instrumentation thất bại — xem /tmp/bolt-instrument.log"
+        tail -10 /tmp/bolt-instrument.log 2>/dev/null || true
+        rm -f "$BOLT_INST_BIN" 2>/dev/null || true
+        return 1
+    fi
+}
+
+_bolt_merge_and_apply() {
+    local _qemu_bin="$1"
+    shift
+    local _fdata_files=("$@")
+
+    [[ ! -x "$_qemu_bin" ]] && return 1
+    [[ "${#_fdata_files[@]}" -eq 0 ]] && return 1
+
+    local _merge_bin; _merge_bin="$(_bolt_merge_binary)"
+    local _bolt_bin; _bolt_bin="$(_bolt_binary)"
+    [[ -z "$_merge_bin" || -z "$_bolt_bin" ]] && return 1
+
+    echo ""
+    echo -e "${C}══════════════════════════════════════════════${W}"
+    echo -e "${C}⚡ LLVM BOLT — Merge & Optimize${W}"
+    echo -e "${C}══════════════════════════════════════════════${W}"
+
+    # Merge tất cả fdata files
+    echo -e "${B}ℹ${W}  Merge ${#_fdata_files[@]} fdata files..."
+    rm -f "${BOLT_FDATA:-${BOLT_PROFILE_DIR}/qemu-bolt.fdata}"
+    "$_merge_bin" "${_fdata_files[@]}" -o "${BOLT_FDATA:-${BOLT_PROFILE_DIR}/qemu-bolt.fdata}" 2>/tmp/bolt-merge.log || {
+        echo -e "${R}✘${W}  merge-fdata thất bại — xem /tmp/bolt-merge.log"
+        tail -10 /tmp/bolt-merge.log 2>/dev/null || true
+        # Fallback: dùng file fdata đầu tiên
+        if [[ -f "${_fdata_files[0]}" ]]; then
+            echo -e "${Y}⚠${W}  Fallback: dùng fdata đơn lẻ ${_fdata_files[0]}"
+            cp -f "${_fdata_files[0]}" "$BOLT_FDATA"
+        else
+            return 1
+        fi
+    }
+
+    local _fdata_size; _fdata_size=$(stat -c%s "${BOLT_FDATA:-${BOLT_PROFILE_DIR}/qemu-bolt.fdata}" 2>/dev/null || echo 0)
+    if [[ "$_fdata_size" -lt 100 ]]; then
+        echo -e "${R}✘${W}  fdata file quá nhỏ (${_fdata_size} bytes) — không đủ profile để tối ưu"
+        return 1
+    fi
+    echo -e "${G}✔${W}  fdata merged: ${BOLT_FDATA:-${BOLT_PROFILE_DIR}/qemu-bolt.fdata} (${_fdata_size} bytes)"
+
+    # Xác định binary gốc (.pre-bolt backup)
+    local _orig_bin="${_qemu_bin}.pre-bolt"
+    if [[ ! -f "$_orig_bin" ]]; then
+        # Instrumented binary hiện đang là _qemu_bin, nhưng ta cần binary gốc
+        # Binary gốc nên đã được backup là .pre-bolt
+        echo -e "${Y}⚠${W}  Không tìm thấy ${_orig_bin} — dùng binary hiện tại"
+        _orig_bin="$_qemu_bin"
+    fi
+
+    local _opt_bin="${_qemu_bin}.bolt-opt"
+
+    echo -e "${B}ℹ${W}  Áp dụng LLVM BOLT optimization..."
+    echo -e "${B}ℹ${W}  Binary gốc:   ${_orig_bin}${W}"
+    echo -e "${B}ℹ${W}  fdata:        ${BOLT_FDATA:-${BOLT_PROFILE_DIR}/qemu-bolt.fdata}${W}"
+    echo -e "${B}ℹ${W}  Output:       ${_opt_bin}${W}"
+
+    # Chạy llvm-bolt với profile
+    if "$_bolt_bin" "$_orig_bin" \
+        -o "$_opt_bin" \
+        -data "${BOLT_FDATA:-${BOLT_PROFILE_DIR}/qemu-bolt.fdata}" \
+        -reorder-blocks=ext-tsp \
+        -reorder-functions=cdsort \
+        -split-functions \
+        -split-all-cold \
+        -peepholes=all \
+        -frame-opt=all \
+        -elim-link-veneers \
+        -lite=0 \
+        -bolt-info=0 \
+        2>/tmp/bolt-optimize.log; then
+
+        # Kiểm tra binary đầu ra
+        local _opt_size; _opt_size=$(stat -c%s "$_opt_bin" 2>/dev/null || echo 0)
+        local _orig_size; _orig_size=$(stat -c%s "$_orig_bin" 2>/dev/null || echo 0)
+        if [[ "$_opt_size" -lt 1024 ]]; then
+            echo -e "${R}✘${W}  BOLT output quá nhỏ (${_opt_size} bytes) — thất bại"
+            return 1
+        fi
+
+        # Kiểm tra binary optimized có chạy được không
+        if ! "$_opt_bin" --version >/dev/null 2>&1; then
+            echo -e "${R}✘${W}  BOLT-optimized binary không chạy được (--version failed)"
+            echo -e "${Y}⚠${W}  Giữ lại binary gốc — không thay thế${W}"
+            rm -f "$_opt_bin" 2>/dev/null || true
+            return 1
+        fi
+
+        # Thay thế binary
+        mv -f "$_opt_bin" "$_qemu_bin"
+        chmod +x "$_qemu_bin"
+
+        # Đánh dấu BOLT đã áp dụng (per-OS marker)
+        echo "$(date -Iseconds)" > "${BOLT_COMPLETE_MARKER:-${BOLT_PROFILE_DIR}/.bolt-complete}"
+        BOLT_MODE=2
+
+        echo -e "${G}✔${W}  BOLT optimization hoàn tất!"
+        echo -e "${G}   Binary gốc:   ${_orig_size} bytes${W}"
+        echo -e "${G}   Binary BOLT:  ${_opt_size} bytes${W}"
+        echo -e "${G}   Backup:       ${_orig_bin}${W}"
+
+        # Xóa instrumented binary để tiết kiệm disk
+        rm -f "$BOLT_INST_BIN" 2>/dev/null || true
+        return 0
+    else
+        echo -e "${R}✘${W}  BOLT optimization thất bại — xem /tmp/bolt-optimize.log"
+        tail -20 /tmp/bolt-optimize.log 2>/dev/null || true
+        return 1
+    fi
+}
+
+_bolt_finalize_after_vm() {
+    # Được gọi sau khi VM dừng, nếu BOLT_MODE=1 (đang collect profile)
+    [[ "$BOLT_MODE" != "1" ]] && return 0
+
+    # Đảm bảo BOLT context được set theo Windows OS (nếu chưa có)
+    if [[ -z "${BOLT_PROFILE_KEY:-}" ]]; then
+        _bolt_prepare_context "${win_choice:-5}"
+    fi
+
+    echo ""
+    echo -e "${C}══════════════════════════════════════════════${W}"
+    echo -e "${C}⚡ LLVM BOLT — Finalize${W}"
+    echo -e "${C}══════════════════════════════════════════════${W}"
+
+    # Kiểm tra có fdata files không
+    local _fdata_files=()
+    local _fcount=0
+    if compgen -G "${BOLT_PROFILE_DIR}/${BOLT_PROFILE_KEY}*" >/dev/null 2>&1; then
+        while IFS= read -r -d '' _f; do
+            local _fsz; _fsz=$(stat -c%s "$_f" 2>/dev/null || echo 0)
+            [[ "$_fsz" -gt 100 ]] || continue
+            _fdata_files+=("$_f")
+            _fcount=$((_fcount + 1))
+        done < <(find "$BOLT_PROFILE_DIR" -maxdepth 1 \( -name "${BOLT_PROFILE_KEY}*" -o -name "*.fdata" \) -type f -print0 2>/dev/null)
+    fi
+
+    if [[ "$_fcount" -eq 0 ]]; then
+        echo -e "${Y}⚠${W}  Không tìm thấy fdata files trong ${BOLT_PROFILE_DIR:-/tmp/qemu-bolt-prof}/${BOLT_PROFILE_KEY:-default}"
+        echo -e "${Y}⚠${W}  VM có thể chưa chạy đủ lâu — khôi phục binary gốc${W}"
+
+        # Restore original binary (instrumented → original)
+        local _orig="${BOLT_ORIG_BIN}.pre-bolt"
+        if [[ -f "$_orig" ]]; then
+            cp -f "$_orig" "$BOLT_ORIG_BIN"
+            chmod +x "$BOLT_ORIG_BIN"
+            echo -e "${G}✔${W}  Đã khôi phục binary gốc${W}"
+        fi
+        BOLT_MODE=0
+        return 1
+    fi
+
+    echo -e "${G}✔${W}  Tìm thấy $_fcount fdata files — merge và apply BOLT"
+
+    # Restore original binary trước khi optimize
+    local _orig="${BOLT_ORIG_BIN}.pre-bolt"
+    if [[ -f "$_orig" ]]; then
+        cp -f "$_orig" "$BOLT_ORIG_BIN"
+        chmod +x "$BOLT_ORIG_BIN"
+    fi
+
+    if _bolt_merge_and_apply "$BOLT_ORIG_BIN" "${_fdata_files[@]}"; then
+        # Giữ lại các fdata files cho lần build sau
+        echo -e "${G}✔${W}  BOLT finalize hoàn tất — binary đã được tối ưu${W}"
+        BOLT_MODE=2
+        return 0
+    else
+        echo -e "${R}✘${W}  BOLT finalize thất bại — giữ binary gốc${W}"
+        BOLT_MODE=0
+        return 1
+    fi
 }
 
 # ════════════════════════════════════════════════════════════════
@@ -284,117 +715,6 @@ _bootstrap_tools
 
 
 # ════════════════════════════════════════════════════════════════
-#  APPIMAGE VALIDATION (self-test cho runtime)
-# ════════════════════════════════════════════════════════════════
-_qemu_appimage_selftest() {
-    echo -e "${C}══════════════════════════════════════════════${W}"
-    echo -e "${C}🔍 QEMU 11 APPIMAGE SELF-TEST${W}"
-    echo -e "${C}══════════════════════════════════════════════${W}"
-    local _img=""
-    local _test_ok=0
-
-    # Tìm AppImage
-    if [[ -n "${WINBOXES_QEMU_APPIMAGE:-}" && -x "${WINBOXES_QEMU_APPIMAGE}" ]]; then
-        _img="${WINBOXES_QEMU_APPIMAGE}"
-    else
-        _img="$(_resolve_qemu_appimage 2>/dev/null || echo '')"
-    fi
-
-    if [[ -z "$_img" || ! -x "$_img" ]]; then
-        echo -e "${R}✘${W} Không tìm thấy QEMU 11 AppImage"
-        echo -e "${Y}💡${W} Đặt WINBOXES_QEMU_APPIMAGE=<path> hoặc đảm bảo AppImage ở cạnh script / user-space"
-        return 1
-    fi
-
-    echo -e "${G}✔${W} AppImage executable: ${_img}"
-    echo -e "${G}✔${W} Path: $(dirname "$_img")"
-
-    # Kiểm tra version
-    local _ver
-    _ver=$(timeout 15 "$_img" --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "unknown")
-    if [[ "$_ver" == 11.* ]]; then
-        echo -e "${G}✔${W} QEMU version: $_ver (QEMU 11.x verified)"
-        _test_ok=$(( _test_ok + 1 ))
-    else
-        echo -e "${Y}⚠${W} QEMU version: $_ver (không phải 11.x?)"
-    fi
-
-    # Kiểm tra qemu-system-x86_64 bundled
-    local _sys_bin="$(_resolve_qemu_bin 2>/dev/null || echo '')"
-    if [[ -n "$_sys_bin" && -x "$_sys_bin" ]]; then
-        echo -e "${G}✔${W} qemu-system-x86_64 bundled/resolvable: $_sys_bin"
-        _test_ok=$(( _test_ok + 1 ))
-    else
-        echo -e "${R}✘${W} qemu-system-x86_64 KHÔNG khả dụng"
-    fi
-
-    # Kiểm tra qemu-img bundled
-    local _img_bin="$(_resolve_qemu_appimage_img 2>/dev/null || echo '')"
-    if [[ -n "$_img_bin" ]]; then
-        echo -e "${G}✔${W} qemu-img bundled/resolvable: $_img_bin"
-        _test_ok=$(( _test_ok + 1 ))
-    else
-        echo -e "${R}✘${W} qemu-img KHÔNG khả dụng"
-    fi
-
-    # Kiểm tra runtime libraries (LD_LIBRARY_PATH hoặc AppDir lib)
-    local _lib_check=0
-    for _check_lib in libslirp.so libglib-2.0.so libpixman-1.so; do
-        if find "$(dirname "$_img" 2>/dev/null || echo '.')" /usr/lib /lib -name "$_check_lib" 2>/dev/null | head -1 >/dev/null; then
-            _lib_check=1
-            break
-        fi
-    done
-    if [[ $_lib_check -eq 1 ]]; then
-        echo -e "${G}✔${W} Runtime libraries: available (AppDir or host compatible)"
-        _test_ok=$(( _test_ok + 1 ))
-    else
-        echo -e "${Y}⚠${W} Runtime libraries: kiểm tra thêm (có thể vẫn hoạt động nhờ AppDir hoặc host)"
-    fi
-
-    # Kiểm tra TCG (không cần KVM)
-    echo -e "${B}ℹ${W} TCG mode check: TCG hoạt động hoàn toàn không cần /dev/kvm"
-    echo -e "${B}ℹ${W} KVM dependency: KHÔNG bắt buộc (${_kvm_flag:-N/A})"
-    _test_ok=$(( _test_ok + 1 ))
-
-    # Kiểm tra Rootless execution (không cần sudo)
-    if [[ "$(id -u)" != "0" ]]; then
-        echo -e "${G}✔${W} Rootless execution: running as $(id -un) (uid=$(id -u)) — no sudo required"
-    else
-        echo -e "${Y}⚠${W} Rootless execution: currently running as root, but script supports rootless"
-    fi
-    _test_ok=$(( _test_ok + 1 ))
-
-    # Kiểm tra firmware/data có thể truy cập
-    local _fw_path=""
-    for _fw_search in "$(dirname "$_img")/usr/share/qemu" "/usr/share/qemu"; do
-        if [[ -d "$_fw_search" ]]; then
-            _fw_path="$_fw_search"
-            break
-        fi
-    done
-    if [[ -n "$_fw_path" ]]; then
-        echo -e "${G}✔${W} Firmware/share data: $_fw_path"
-        _test_ok=$(( _test_ok + 1 ))
-    else
-        echo -e "${Y}⚠${W} Firmware/share data: không tìm thấy tại vị trí chuẩn (có thể vẫn có trong AppDir)"
-    fi
-
-    echo -e "${C}══════════════════════════════════════════════${W}"
-    echo -e "${G}✅ Self-test scores: ${_test_ok}/7 passed${W}"
-    echo -e "${C}══════════════════════════════════════════════${W}"
-    return 0
-}
-
-# ════════════════════════════════════════════════════════════════
-#  SELF-TEST (optional, non-blocking)
-# ════════════════════════════════════════════════════════════════
-# Nếu người dùng muốn kiểm tra nhanh backend trước khi chạy VM
-if [[ "${WINBOX_SELFTEST:-0}" == "1" ]]; then
-    _qemu_appimage_selftest || true
-fi
-
-# ════════════════════════════════════════════════════════════════
 #  CLI ARGUMENT PARSER
 #  --auto          : bỏ qua tất cả câu hỏi, chạy hoàn toàn tự động
 #  --win2012       : Windows Server 2012 R2
@@ -403,12 +723,13 @@ fi
 #  --win10ltsb     : Windows 10 LTSB 2015
 #  --win10ltsc     : Windows 10 LTSC 2023
 #  --rdp           : tự động mở tunnel RDP sau khi VM chạy
-#  --build         : force tải lại QEMU AppImage dù đã có sẵn
-#  --no-build      : bỏ qua tải QEMU AppImage
+#  --build         : force build QEMU dù đã có sẵn
+#  --no-build      : bỏ qua build QEMU
 # ════════════════════════════════════════════════════════════════
 AUTO_MODE=0        # 1 = không hỏi bất cứ gì
 AUTO_WIN=""        # win choice preset: 1-5
-AUTO_BUILD=""      # "yes" | "no" | "" (hỏi) — áp dụng cho việc tải AppImage
+AUTO_BUILD=""      # "yes" | "no" | "" (hỏi)
+PGO_MODE=0        # --pgo: build QEMU with PGO train/use flow
 INSTANCE_ID=1      # VM instance id  (--id=N)
 EXTRA_FWDS=()      # extra hostfwd   (--port-forward=HOST:GUEST)
 _EXTRA_FWDS_STR=""   # built from EXTRA_FWDS, pre-initialized to avoid set -u crash
@@ -437,6 +758,8 @@ for _arg in "$@"; do
         --win10ltsc)  AUTO_WIN=5     ;;
         --build|--rebuild) AUTO_BUILD="yes" ;;
         --no-build)   AUTO_BUILD="no"  ;;
+        --pgo)         PGO_MODE=1 ;;
+        --llvm-bolt|--bolt) BOLT_MODE=1 ;;
         --http-img|--no-download) USE_HTTP_BACKEND=1 ;;
         --safe-download) SAFE_DOWNLOAD=1 ;;
         --id=*)       INSTANCE_ID="${_arg#--id=}" ;;
@@ -464,9 +787,12 @@ for _arg in "$@"; do
             echo "  --win10ltsb     Windows 10 LTSB 2015"
             echo "  --win10ltsc     Windows 10 LTSC 2023"
             echo "  --win10ltsb2022 Windows 10 LTSB 2022"
-            echo "  --build         Force tải lại QEMU AppImage (dù đã có)"
+            echo "  --build         Force build QEMU (dù đã có)"
             echo "  --rebuild       Alias của --build"
-            echo "  --no-build      Bỏ qua tải QEMU AppImage"
+            echo "  --no-build      Bỏ qua build QEMU"
+            echo "  --pgo           Bật PGO train/use flow và lưu profile theo từng Windows OS"
+            echo "  --llvm-bolt     Bật LLVM BOLT optimization (mặc định TẮT, cần root mode)"
+            echo "  NO_BOLT=1       Tắt LLVM BOLT optimization (dù có --llvm-bolt)"
             echo "  --id=N          Multi-VM: instance id (RDP port=3388+N, default N=1)"
             echo "  --port-forward=H:G  Thêm hostfwd TCP (vd: --port-forward=8080:80)"
             echo "  --status        Xem thông tin VM đang chạy"
@@ -477,13 +803,13 @@ for _arg in "$@"; do
             echo "  --resize=+XG    Mở rộng disk image (VM phải đang tắt)
   --safe-download Tải file theo chunks 900MB (cho môi trường giới hạn dung lượng)"
             echo "  --http-img      Dùng QEMU HTTP backend (không tải về)"
-            echo "  --delete-build  Xoá QEMU AppImage đã tải (opt/home/rootless)"
+            echo "  --delete-build  Xoá toàn bộ QEMU build hiện tại (opt/home/rootless)"
             echo "  --delete-iso    Xoá toàn bộ ISO cache (~/.cache/winbox-iso)"
             echo "  --iso=URL       Boot từ Windows ISO (cần --virtio=URL cho driver)"
             echo "  --iso           Boot từ ISO (hỏi URL interactive)"
             echo "  --virtio=URL    VirtIO driver ISO URL (dùng với --iso)"
-            echo "  Nếu QEMU AppImage đã có sẵn, script tự động bỏ qua tải."
-            echo "  Dùng --rebuild để tải lại từ đầu."
+            echo "  Nếu QEMU đã có sẵn, script tự động bỏ qua build."
+            echo "  Dùng --rebuild để build lại từ đầu."
             exit 0
             ;;
         *) echo -e "${Y}⚠${W}  Unknown argument: $_arg (bỏ qua)"; ;;
@@ -563,9 +889,6 @@ if [[ "$STOP_MODE" == "1" || "$RESTART_MODE" == "1" ]]; then
     else
         echo -e "${Y}⚠${W}  Không có VM nào đang chạy (instance $INSTANCE_ID)"
     fi
-    # Cleanup Boot Monitor
-    echo -e "${B}ℹ${W} Dọn dẹp VNC Boot Monitor..."
-    _bootmon_stop || true
     rm -f "$WINVM_PID_FILE" "$WINVM_STATE_FILE"
     [[ "$STOP_MODE" == "1" ]] && exit 0
     echo -e "${B}ℹ${W}  Khởi động lại VM..."
@@ -644,25 +967,31 @@ if [[ "$DELETE_BUILD_MODE" == "1" ]]; then
             echo -e "${Y}—${W}  ${label}: ${d} (không có)"
         fi
     }
-    _del_dir "/opt/qemu-optimized"         "QEMU build cũ (legacy, không còn dùng)"
-    _del_dir "$HOME/qemu-optimized"        "QEMU build cũ (legacy, không còn dùng)"
-    _del_dir "$HOME/qemu-static"           "QEMU AppImage prefix (rootless/root chung)"
+    _del_dir "/opt/qemu-optimized"         "opt build"
+    _del_dir "$HOME/qemu-optimized"        "home build"
+    _del_dir "$HOME/qemu-static"           "rootless build"
     _del_dir "$HOME/qemu-env"              "python venv"
-    _del_dir "/tmp/AppDir"                  "AppDir temp"
-    # Xóa user-space AppImage chỉ khi người dùng yêu cầu
-    # (giữ lại để tái sử dụng)
-    # rm -f "$HOME/.local/share/winboxes/QEMU-11.AppImage" 2>/dev/null || true
+    _del_dir "$HOME/qemu-build"            "rootless build dir"
+    _del_dir "/tmp/qemu-src"               "QEMU source"
+    _del_dir "/tmp/qemu-build"             "build artifacts"
+    _del_dir "/tmp/qemu-pgo-prof"          "PGO profiles"
+    _del_dir "/tmp/qemu-bolt-prof"         "BOLT profiles (all OS)"
+    # Xóa cả các thư mục con phân loại theo OS
+    for _bolt_os_dir in /tmp/qemu-bolt-prof-*; do
+        [[ -e "$_bolt_os_dir" ]] && _del_dir "$_bolt_os_dir" "BOLT profile $(basename "$_bolt_os_dir")"
+    done
     # Clean logs
-    rm -f /tmp/qemu-*.log /tmp/pip-*.log /tmp/venv-*.log 2>/dev/null || true
+    rm -f /tmp/qemu-*.log /tmp/bolt-*.log /tmp/pip-*.log \
+          /tmp/glib-*.log /tmp/venv-*.log 2>/dev/null || true
     echo -e "${G}✔${W} Logs dọn sạch"
     echo ""
     echo -e "${C}══════════════════════════════════════${W}"
     if [[ "$_DELETED" -gt 0 ]]; then
-        echo -e "${G}✅ Xoá xong $_DELETED thư mục${W}"
+        echo -e "${G}✅ Xoá xong $_DELETED thư mục build${W}"
     else
-        echo -e "${Y}⚠️  Không tìm thấy gì để xoá${W}"
+        echo -e "${Y}⚠️  Không tìm thấy build nào để xoá${W}"
     fi
-    echo -e "${B}ℹ${W}  Chạy lại script để tải QEMU AppImage mới: bash winbox.sh --rebuild"
+    echo -e "${B}ℹ${W}  Chạy lại script để build mới: bash winbox.sh --rebuild"
     echo -e "${C}══════════════════════════════════════${W}"
     exit 0
 fi
@@ -750,252 +1079,6 @@ spin_fail() {
     printf "\r${R}✘${W} %s\n" "$msg"
 }
 
-
-
-# ════════════════════════════════════════════════════════════════
-#  VNC BOOT MONITOR / BOOT PROGRESS (Rootless, background, non-blocking)
-# ════════════════════════════════════════════════════════════════
-BOOTMON_ENABLED="${WINBOX_BOOTMON:-1}"
-BOOTMON_LOG_FILE="${BOOTMON_LOG_FILE:-$HOME/.local/share/winboxes/logs/winboxes-boot.log}"
-BOOTMON_VNC_HOST="${BOOTMON_VNC_HOST:-localhost}"
-BOOTMON_VNC_PORT="${BOOTMON_VNC_PORT:-5900}"
-BOOTMON_POLL_INTERVAL="${BOOTMON_POLL_INTERVAL:-3}"
-BOOTMON_MAX_DURATION="${BOOTMON_MAX_DURATION:-300}"  # 5 phút max
-BOOTMON_OCR_CMD="${BOOTMON_OCR_CMD:-}"
-BOOTMON_UI_CMD="${BOOTMON_UI_CMD:-}"
-BOOTMON_PID_FILE="${BOOTMON_PID_FILE:-/tmp/winboxes-bootmon-${INSTANCE_ID:-1}.pid}"
-BOOTMON_DETECTED_STAGE=""
-BOOTMON_DETECTED_AT=0
-BOOTMON_VNC_RES=""
-
-_bootmon_ensure_dirs() {
-    mkdir -p "$HOME/.local/share/winboxes/logs" "$HOME/.local/share/winboxes/state"
-    mkdir -p "$HOME/.cache/winboxes"
-}
-
-_bootmon_log() {
-    local event="$1"
-    local detail="${2:-}"
-    _bootmon_ensure_dirs
-    local ts; ts=$(date -Iseconds 2>/dev/null || date '+%Y-%m-%d %H:%M:%S')
-    echo "[$ts] [BOOTMON] $event ${detail}" >> "$BOOTMON_LOG_FILE"
-}
-
-_bootmon_stage_string() {
-    echo "$BOOTMON_DETECTED_STAGE"
-}
-
-_bootmon_detect_stage_from_vnc() {
-    # Kết nối VNC để đọc framebuffer
-    # Sử dụng vncscreenshot hoặc python-vnc nếu có; fallback: giả lập phát hiện
-    local vnc_host="$BOOTMON_VNC_HOST"
-    local vnc_port="$BOOTMON_VNC_PORT"
-    local stage="Detecting..."
-    local vnc_ok=0
-
-    # Kiểm tra VNC server có đang chạy không
-    if command -v ss &>/dev/null; then
-        if ! ss -tuln 2>/dev/null | grep -q ":${vnc_port}"; then
-            stage="VNC connecting..."
-            return
-        fi
-    elif command -v netstat &>/dev/null; then
-        if ! netstat -tuln 2>/dev/null | grep -q ":${vnc_port}"; then
-            stage="VNC connecting..."
-            return
-        fi
-    fi
-    vnc_ok=1
-
-    # Nếu VNC đã kết nối, kiểm tra stage bằng cách phân tích framebuffer (giả lập với OCR nếu có)
-    # Thực tế: dùng vncscreenshot (python) hoặc trực tiếp đọc framebuffer qua Python
-    local fb_changed=0
-    local last_fb_hash=""
-
-    if command -v python3 &>/dev/null; then
-        # Thử đọc framebuffer qua VNC nếu có thư viện hỗ trợ; nếu không thì fallback
-        # Ở đây chúng ta thực hiện phát hiện stage dựa trên thời gian và sự kiện hệ thống
-        # mà không cần tạo VM thứ hai.
-        if [[ -f "/tmp/qemu-launch-$$.log" ]] || [[ -f "/tmp/qemu-launch.log" ]]; then
-            # Nếu QEMU log có các từ khóa liên quan đến boot
-            if grep -q -i -E "BIOS|UEFI|boot manager|loading|login|windows" /tmp/qemu-launch-$$.log 2>/dev/null || grep -q -i -E "BIOS|UEFI|boot manager|loading|login|windows" /tmp/qemu-launch.log 2>/dev/null; then
-                if grep -q -i -E "login|welcome|password|user" /tmp/qemu-launch-$$.log 2>/dev/null || grep -q -i -E "login|welcome|password|user" /tmp/qemu-launch.log 2>/dev/null; then
-                    stage="Windows login screen"
-                elif grep -q -i -E "windows loading|starting windows" /tmp/qemu-launch-$$.log 2>/dev/null || grep -q -i -E "windows loading|starting windows" /tmp/qemu-launch.log 2>/dev/null; then
-                    stage="Windows loading"
-                elif grep -q -i -E "boot manager|bootmgr" /tmp/qemu-launch-$$.log 2>/dev/null || grep -q -i -E "boot manager|bootmgr" /tmp/qemu-launch.log 2>/dev/null; then
-                    stage="Windows Boot Manager"
-                elif grep -q -i -E "BIOS|UEFI|seabios|ovmf" /tmp/qemu-launch-$$.log 2>/dev/null || grep -q -i -E "BIOS|UEFI|seabios|ovmf" /tmp/qemu-launch.log 2>/dev/null; then
-                    stage="BIOS/UEFI"
-                else
-                    stage="Windows booting..."
-                fi
-            else
-                stage="Starting QEMU / VNC connecting"
-            fi
-        else
-            # Fallback dựa trên thời gian từ khi khởi động
-            local elapsed=$(( $(date +%s) - ${BOOTMON_START_TIME:-$(date +%s)} ))
-            if [[ $elapsed -lt 10 ]]; then
-                stage="Starting QEMU"
-            elif [[ $elapsed -lt 30 ]]; then
-                stage="VNC connecting / BIOS"
-            elif [[ $elapsed -lt 90 ]]; then
-                stage="BIOS/UEFI"
-            elif [[ $elapsed -lt 180 ]]; then
-                stage="Windows Boot Manager"
-            elif [[ $elapsed -lt 300 ]]; then
-                stage="Windows loading"
-            else
-                stage="Windows login screen / Boot completed"
-            fi
-        fi
-    else
-        stage="Detecting... (no python3)"
-    fi
-
-    # Nếu có OCR engine (tesseract hoặc python pytesseract), thử phân tích
-    if [[ -n "${BOOTMON_OCR_CMD}" ]] && [[ -n "$stage" ]]; then
-        # OCR thực tế sẽ được thực hiện qua background worker nếu dependency có
-        # Ở đây giữ nguyên logic phát hiện không phụ thuộc bắt buộc vào OCR
-        :
-    fi
-
-    BOOTMON_DETECTED_STAGE="$stage"
-    echo "$stage"
-}
-
-_bootmon_start_background() {
-    if [[ "${BOOTMON_ENABLED}" != "1" ]]; then
-        return 0
-    fi
-    if [[ -n "${BOOTMON_PID_FILE}" ]] && [[ -f "$BOOTMON_PID_FILE" ]]; then
-        local old_pid; old_pid=$(cat "$BOOTMON_PID_FILE" 2>/dev/null || echo "")
-        if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
-            # Đã có monitor đang chạy
-            return 0
-        fi
-    fi
-
-    # Lưu thời điểm bắt đầu
-    export BOOTMON_START_TIME=$(date +%s)
-    _bootmon_ensure_dirs
-    _bootmon_log "MONITOR_STARTED" "PID parent=$$ VM instance=${INSTANCE_ID:-1}"
-
-    # Tạo background process cho boot monitor
-    (
-        local start_time=$(date +%s)
-        local max_duration=${BOOTMON_MAX_DURATION:-300}
-        local poll_interval=${BOOTMON_POLL_INTERVAL:-3}
-        local vnc_port=${BOOTMON_VNC_PORT:-5900}
-        local vnc_res=""
-
-        # Ghi PID
-        echo "$$" > "$BOOTMON_PID_FILE"
-
-        while true; do
-            local now=$(date +%s)
-            local elapsed=$((now - start_time))
-
-            # Kiểm tra QEMU còn chạy không
-            local qemu_pid=""
-            if [[ -f "/tmp/winvm-${INSTANCE_ID:-1}.pid" ]]; then
-                qemu_pid=$(cat "/tmp/winvm-${INSTANCE_ID:-1}.pid" 2>/dev/null || echo "")
-            fi
-            if [[ -n "$qemu_pid" ]] && ! kill -0 "$qemu_pid" 2>/dev/null; then
-                # VM đã dừng
-                _bootmon_log "VM_STOPPED" "PID $qemu_pid không còn; elapsed=${elapsed}s"
-                # Chờ thêm một chút để cleanup hoàn tất
-                sleep 2
-                break
-            fi
-
-            if [[ $elapsed -gt $max_duration ]]; then
-                _bootmon_log "TIMEOUT" "Max duration ${max_duration}s reached"
-                break
-            fi
-
-            # Phát hiện stage hiện tại
-            local stage
-            stage=$(_bootmon_detect_stage_from_vnc)
-            local ts; ts=$(date -Iseconds 2>/dev/null || date '+%Y-%m-%d %H:%M:%S')
-
-            # Ghi log thực tế
-            echo "[$ts] [BOOTMON] Stage: $stage (elapsed: ${elapsed}s, VNC port: $vnc_port, res: $vnc_res)" >> "$BOOTMON_LOG_FILE"
-
-            # Nếu phát hiện login screen hoặc boot completed, đánh dấu và kết thúc sau một khoảng ngắn
-            if echo "$stage" | grep -q -i -E "login screen|boot completed"; then
-                BOOTMON_DETECTED_AT=$(date +%s)
-                BOOTMON_DETECTED_STAGE="$stage"
-                _bootmon_log "BOOT_COMPLETED_OR_LOGIN" "Stage: $stage at ${ts}"
-                # Đợi thêm 15 giây để ổn định rồi kết thúc
-                local completed_time=$(date +%s)
-                sleep 15
-                # Kiểm tra lại VM còn chạy không trước khi thoát
-                if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
-                    # Vẫn chạy, thoát monitor bình thường
-                    break
-                fi
-                break
-            fi
-
-            # Nếu có GUI (DISPLAY hoặc WAYLAND_DISPLAY), thử hiển thị cửa sổ riêng nhẹ
-            # Nếu không có GUI, tự động fallback về log mode (không tạo dependency bắt buộc)
-            if [[ -n "${DISPLAY:-}" ]] || [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
-                # Thử dùng zenity, kdialog, yad hoặc python-gtk nếu có
-                if command -v zenity &>/dev/null; then
-                    # Cập nhật UI nhẹ (chỉ khi GUI khả dụng)
-                    (
-                        echo "$stage (elapsed: ${elapsed}s)" | zenity --text-info --title="WinBoxes Boot Monitor" --width=400 --timeout=5 2>/dev/null || true
-                    ) 2>/dev/null || true
-                elif command -v yad &>/dev/null; then
-                    (
-                        echo "$stage (elapsed: ${elapsed}s)" | yad --text-info --title="WinBoxes Boot Monitor" --width=400 --timeout=5 2>/dev/null || true
-                    ) 2>/dev/null || true
-                elif command -v kdialog &>/dev/null; then
-                    (
-                        echo "$stage (elapsed: ${elapsed}s)" | kdialog --title "WinBoxes Boot Monitor" --textbox /dev/stdin 400 200 2>/dev/null || true
-                    ) 2>/dev/null || true
-                fi
-            fi
-
-            # Chỉ thực hiện OCR hoặc phân tích hình ảnh khi màn hình thay đổi đáng kể
-            # Ở đây giữ interval thấp để giảm CPU overhead
-            sleep "$poll_interval"
-        done
-
-        # Cleanup PID file
-        rm -f "$BOOTMON_PID_FILE"
-        _bootmon_log "MONITOR_EXIT" "Background monitor exited gracefully"
-    ) &
-
-    # Ghi PID của monitor con
-    if [[ -n "${BOOTMON_PID_FILE}" ]]; then
-        # PID sẽ được ghi bởi background process chính nó
-        # Đợi một chút để background process khởi tạo
-        sleep 0.5
-    fi
-    return 0
-}
-
-_bootmon_stop() {
-    if [[ -n "${BOOTMON_PID_FILE}" ]] && [[ -f "$BOOTMON_PID_FILE" ]]; then
-        local bp; bp=$(cat "$BOOTMON_PID_FILE" 2>/dev/null || echo "")
-        if [[ -n "$bp" ]]; then
-            kill -TERM "$bp" 2>/dev/null || true
-            sleep 1
-            kill -0 "$bp" 2>/dev/null || kill -KILL "$bp" 2>/dev/null || true
-        fi
-        rm -f "$BOOTMON_PID_FILE"
-    fi
-    # Dọn dẹp các worker phụ nếu có
-    pkill -f "winboxes-bootmon" 2>/dev/null || true
-}
-
-_bootmon_cleanup_all() {
-    _bootmon_stop
-    # Không xóa log file để giữ lịch sử
-}
 
 _download_chunked() {
     local url="$1" output="$2" chunk_mb="${3:-900}"
@@ -1178,7 +1261,7 @@ _detect_kvm() {
 }
 
 # ════════════════════════════════════════════════════════════════
-#  PACKAGE MANAGER — root → sudo apt (deps phụ trợ), QEMU luôn dùng AppImage
+#  PACKAGE MANAGER — root → sudo apt → rootless build từ source
 # ════════════════════════════════════════════════════════════════
 
 APT_CMD=""
@@ -1233,8 +1316,766 @@ apt_install() {
 }
 
 # ════════════════════════════════════════════════════════════════
-#  QEMU APPIMAGE SETUP (prebuilt, dùng chung cho root và rootless)
+#  BUILD LIBRARIES FROM SOURCE (khi không có conda)
 # ════════════════════════════════════════════════════════════════
+
+# _rootless_resume_skip: kiểm tra checkpoint và cache để bỏ qua các step đã hoàn thành
+_rootless_resume_skip() {
+    local _step="$1" _prefix="$2" _lib_name="$3" _lib_file="$4"
+    local _resume_file="${BUILD:-/tmp/qemu-build}/.rootless-resume"
+    # Check if the library already exists in prefix (cached from previous build)
+    if [[ -n "$_lib_file" && -f "$_prefix/$_lib_file" ]]; then
+        _rl_ok "${_lib_name} đã có trong cache ($_prefix) — bỏ qua build"
+        return 0
+    fi
+    # Check if resume file says we've already passed this step
+    if [[ -f "$_resume_file" ]]; then
+        local _resume_step; _resume_step=$(cat "$_resume_file" 2>/dev/null || echo "")
+        case "$_resume_step" in
+            libffi|pixman|glib|qemu)
+                if [[ "$_step" == "zlib" ]]; then
+                    # resume point is after zlib — zlib is done
+                    _rl_ok "zlib đã build trước đó (resume point: $_resume_step) — bỏ qua"
+                    return 0
+                fi
+                ;;
+        esac
+        if [[ "$_resume_step" == "pixman" || "$_resume_step" == "glib" || "$_resume_step" == "qemu" ]]; then
+            if [[ "$_step" == "zlib" || "$_step" == "libffi" ]]; then
+                _rl_ok "${_lib_name} đã build trước đó (resume point: $_resume_step) — bỏ qua"
+                return 0
+            fi
+        fi
+        if [[ "$_resume_step" == "glib" || "$_resume_step" == "qemu" ]]; then
+            if [[ "$_step" == "pixman" ]]; then
+                _rl_ok "pixman đã build trước đó (resume point: $_resume_step) — bỏ qua"
+                return 0
+            fi
+        fi
+        if [[ "$_resume_step" == "qemu" ]]; then
+            if [[ "$_step" == "glib" ]]; then
+                _rl_ok "glib đã build trước đó (resume point: qemu) — bỏ qua"
+                return 0
+            fi
+        fi
+    fi
+    return 1
+}
+
+_build_zlib_from_source() {
+    local prefix="$1"; local build_dir="$2"
+    if _rootless_resume_skip "zlib" "$prefix" "zlib" "lib/libz.a"; then return 0; fi
+    _rl_step "${_RL_N:-1}" "${_RL_T:-10}" "zlib 1.3.1"
+    cd "$build_dir"
+    rm -f zlib.tar.gz
+    local _ok=0
+    for _url in \
+        "https://zlib.net/zlib-1.3.1.tar.gz" \
+        "https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz" \
+        "https://github.com/madler/zlib/archive/refs/tags/v1.3.1.tar.gz"; do
+        wget -q --timeout=60 --tries=2 "$_url" -O zlib.tar.gz 2>/dev/null \
+            && tar tzf zlib.tar.gz &>/dev/null && _ok=1 && break
+        echo -e "${Y}⚠${W}  zlib URL thất bại: $_url"
+    done
+    [[ "$_ok" == "0" ]] && { echo -e "${R}✘${W} Không tải được zlib"; exit 1; }
+    tar xzf zlib.tar.gz 2>/dev/null || { echo -e "${R}✘${W} Giải nén zlib thất bại"; exit 1; }
+    local _d; _d=$(ls -d zlib-*/ 2>/dev/null | head -1 | tr -d /)
+    [[ -d "$_d" ]] || { echo -e "${R}✘${W} Không tìm thấy thư mục zlib"; exit 1; }
+    cd "$_d"
+    # Patch out the "too harsh" if-block using python3 (safe: removes full if/fi block)
+    python3 - configure <<'PYEOF'
+import sys
+fname = sys.argv[1]
+with open(fname, 'r', errors='replace') as f:
+    lines = f.readlines()
+out = []
+i = 0
+while i < len(lines):
+    line = lines[i]
+    if line.strip().startswith('if ') or line.strip().startswith('if\t'):
+        block = [line]
+        depth = 1
+        j = i + 1
+        while j < len(lines) and depth > 0:
+            bl = lines[j].strip()
+            if bl.startswith('if ') or bl.startswith('if\t') or bl == 'if':
+                depth += 1
+            if bl == 'fi' or bl.startswith('fi;') or bl.startswith('fi '):
+                depth -= 1
+            block.append(lines[j])
+            j += 1
+        if 'too harsh' in ''.join(block):
+            i = j
+            continue
+        else:
+            out.extend(block)
+            i = j
+    else:
+        out.append(line)
+        i += 1
+with open(fname, 'w') as f:
+    f.writelines(out)
+pass  # suppressed
+PYEOF
+    local _cc="${CC_PLAIN:-$(command -v gcc || command -v cc)}"
+    local _cxx="${CXX_PLAIN:-$(command -v g++ || command -v c++)}"
+    local _ar="${AR:-ar}"
+    local _ranlib="${RANLIB:-ranlib}"
+
+    # Ensure compiler bin dir in PATH so configure can find ar/ranlib
+    local _cc_dir; _cc_dir="$(dirname "$_cc")"
+    [[ -d "$_cc_dir" ]] && export PATH="$_cc_dir:$PATH"
+
+    # Try shared first, fall back to static
+    if env CC="$_cc" CXX="$_cxx" AR="$_ar" RANLIB="$_ranlib" \
+        CFLAGS="-w -O2" CXXFLAGS="-w -O2" LDFLAGS="" \
+        ./configure --prefix="$prefix" --shared > /tmp/zlib-build.log 2>&1; then
+        : # shared OK
+    else
+        env CC="$_cc" CXX="$_cxx" AR="$_ar" RANLIB="$_ranlib" \
+            CFLAGS="-w -O2" CXXFLAGS="-w -O2" LDFLAGS="" \
+            ./configure --prefix="$prefix" > /tmp/zlib-build.log 2>&1 \
+            || { echo -e "${R}✘${W} Configure zlib thất bại — xem /tmp/zlib-build.log"; exit 1; }
+    fi
+    ${MAKE:-make} -j"$(nproc)" AR="$_ar" RANLIB="$_ranlib" >> /tmp/zlib-build.log 2>&1 \
+        || { echo -e "${R}✘${W} Build zlib thất bại — xem /tmp/zlib-build.log"; exit 1; }
+    ${MAKE:-make} install AR="$_ar" RANLIB="$_ranlib" >> /tmp/zlib-build.log 2>&1 \
+        || { echo -e "${R}✘${W} Install zlib thất bại — xem /tmp/zlib-build.log"; exit 1; }
+    _rl_ok "zlib 1.3.1 xong"
+    echo "libffi" > "$BUILD/.rootless-resume"
+}
+
+_build_libffi_from_source() {
+    local prefix="$1"; local build_dir="$2"
+    if _rootless_resume_skip "libffi" "$prefix" "libffi" "lib/libffi.a"; then return 0; fi
+    _rl_step "${_RL_N:-2}" "${_RL_T:-10}" "libffi 3.4.6"
+    cd "$build_dir"
+    rm -f libffi.tar.gz
+    wget -q --timeout=60 --tries=2 \
+        "https://github.com/libffi/libffi/releases/download/v3.4.6/libffi-3.4.6.tar.gz" \
+        -O libffi.tar.gz 2>/dev/null \
+        || wget -q --timeout=60 --tries=2 \
+        "https://sourceware.org/pub/libffi/libffi-3.4.6.tar.gz" \
+        -O libffi.tar.gz 2>/dev/null \
+        || { echo -e "${R}✘${W} Không tải được libffi"; exit 1; }
+    tar xzf libffi.tar.gz 2>/dev/null || { echo -e "${R}✘${W} Giải nén libffi thất bại"; exit 1; }
+    cd libffi-3.4.6
+    local _cc="${CC_PLAIN:-$(command -v gcc || command -v cc)}"
+    local _ar="${AR:-ar}"
+    local _ranlib="${RANLIB:-ranlib}"
+    local _cc_dir; _cc_dir="$(dirname "$_cc")"
+    [[ -d "$_cc_dir" ]] && export PATH="$_cc_dir:$PATH"
+    env CC="$_cc" AR="$_ar" RANLIB="$_ranlib" \
+        ./configure --prefix="$prefix" > /tmp/libffi-build.log 2>&1 \
+        || { echo -e "${R}✘${W} Configure libffi thất bại"; exit 1; }
+    ${MAKE:-make} -j"$(nproc)" AR="$_ar" RANLIB="$_ranlib" >> /tmp/libffi-build.log 2>&1 \
+        || { echo -e "${R}✘${W} Build libffi thất bại"; exit 1; }
+    ${MAKE:-make} install AR="$_ar" RANLIB="$_ranlib" >> /tmp/libffi-build.log 2>&1 \
+        || { echo -e "${R}✘${W} Install libffi thất bại"; exit 1; }
+    _rl_ok "libffi 3.4.6 xong"
+    echo "pixman" > "$BUILD/.rootless-resume"
+}
+
+_build_pixman_from_source() {
+    local prefix="$1"; local build_dir="$2"
+    if _rootless_resume_skip "pixman" "$prefix" "pixman" "lib/libpixman-1.a"; then return 0; fi
+    _rl_step "${_RL_N:-3}" "${_RL_T:-10}" "pixman 0.42.2"
+    cd "$build_dir"
+    rm -f pixman.tar.gz
+    wget -q --timeout=60 --tries=2 \
+        "https://cairographics.org/releases/pixman-0.42.2.tar.gz" \
+        -O pixman.tar.gz 2>/dev/null \
+        || { echo -e "${R}✘${W} Không tải được pixman"; exit 1; }
+    tar xzf pixman.tar.gz 2>/dev/null || { echo -e "${R}✘${W} Giải nén pixman thất bại"; exit 1; }
+    cd pixman-0.42.2
+    local _cc="${CC_PLAIN:-$(command -v gcc || command -v cc)}"
+    local _ar="${AR:-ar}"
+    local _ranlib="${RANLIB:-ranlib}"
+    local _cc_dir; _cc_dir="$(dirname "$_cc")"
+    [[ -d "$_cc_dir" ]] && export PATH="$_cc_dir:$PATH"
+    env CC="$_cc" AR="$_ar" RANLIB="$_ranlib" \
+        ./configure --prefix="$prefix" --disable-gtk --enable-shared \
+        > /tmp/pixman-build.log 2>&1 \
+        || { echo -e "${R}✘${W} Configure pixman thất bại"; exit 1; }
+    ${MAKE:-make} -j"$(nproc)" AR="$_ar" RANLIB="$_ranlib" >> /tmp/pixman-build.log 2>&1 \
+        || { echo -e "${R}✘${W} Build pixman thất bại"; exit 1; }
+    ${MAKE:-make} install AR="$_ar" RANLIB="$_ranlib" >> /tmp/pixman-build.log 2>&1 \
+        || { echo -e "${R}✘${W} Install pixman thất bại"; exit 1; }
+    _rl_ok "pixman 0.42.2 xong"
+    echo "glib" > "$BUILD/.rootless-resume"
+}
+
+# ── Thử dùng glib từ conda (nhanh, không cần build) ─────────────
+_try_glib_from_conda() {
+    local prefix="$1"
+    local _GLIB_MIN="2.66.0"
+
+    # helper: trả về 0 nếu version trong .pc >= _GLIB_MIN
+    _glib_pc_ver_ok() {
+        local _pc="$1/glib-2.0.pc"
+        [[ -f "$_pc" ]] || return 1
+        local _v
+        _v=$(grep "^Version:" "$_pc" 2>/dev/null | awk '{print $2}')
+        python3 -c "
+a=[int(x) for x in '$_v'.split('.')]
+b=[int(x) for x in '${_GLIB_MIN}'.split('.')]
+exit(0 if a>=b else 1)
+" 2>/dev/null
+    }
+
+    # Tìm libglib-2.0.so trong conda
+    local _glib_so=""
+    for _d in /opt/conda/lib /opt/conda/envs/base/lib "$HOME/.conda/envs/base/lib"; do
+        if [[ -f "$_d/libglib-2.0.so" || -f "$_d/libglib-2.0.so.0" ]]; then
+            _glib_so="$_d"; break
+        fi
+    done
+    # Kiểm tra pkg-config glib-2.0 từ conda
+    local _conda_pc=""
+    for _pd in /opt/conda/lib/pkgconfig /opt/conda/share/pkgconfig; do
+        [[ -f "$_pd/glib-2.0.pc" ]] && { _conda_pc="$_pd"; break; }
+    done
+    if [[ -n "$_conda_pc" ]]; then
+        # ── Version check: cần >= 2.66.0 ────────────────────────
+        if ! _glib_pc_ver_ok "$_conda_pc"; then
+            local _found_ver
+            _found_ver=$(grep "^Version:" "$_conda_pc/glib-2.0.pc" 2>/dev/null | awk '{print $2}')
+            echo -e "${Y}⚠${W}  conda glib ${_found_ver} < ${_GLIB_MIN} — bỏ qua, sẽ build từ source"
+            # Không dùng conda glib cũ; fallthrough xuống conda install / build source
+        else
+            local _found_ver
+            _found_ver=$(grep "^Version:" "$_conda_pc/glib-2.0.pc" 2>/dev/null | awk '{print $2}')
+            echo -e "${G}✔${W} glib ${_found_ver} tìm thấy trong conda (${_conda_pc}) — bỏ qua build source"
+            # KHÔNG copy .pc vào prefix: conda glib build với conda toolchain có
+            # GLIB_SIZEOF_SIZE_T khác system gcc → ABI mismatch khi QEMU configure.
+            # Thay vào đó: chỉ export header path + LD path, để QEMU meson detect qua
+            # PKG_CONFIG_PATH trỏ thẳng vào conda (không qua prefix copy).
+            export PKG_CONFIG_PATH="$_conda_pc:${PKG_CONFIG_PATH:-}"
+            export PKG_CONFIG_LIBDIR="$_conda_pc:${PKG_CONFIG_LIBDIR:-}"
+            # Export LD path
+            [[ -n "$_glib_so" ]] && export LD_LIBRARY_PATH="$_glib_so:${LD_LIBRARY_PATH:-}"
+            # Mark: đây là conda glib → QEMU configure dùng --without-system-glib nếu cần
+            export _GLIB_FROM_CONDA=1
+            return 0
+        fi  # end version-ok branch
+    fi
+    # Thử conda install glib nếu có conda
+    if command -v conda &>/dev/null; then
+        echo -e "${B}ℹ${W}  Thử conda install glib (1-2 phút)..."
+        conda install -c conda-forge glib --yes -q > /tmp/conda-glib.log 2>&1 \
+            && echo -e "${G}✔${W} conda install glib xong" \
+            || { echo -e "${Y}⚠${W}  conda install glib thất bại — sẽ build từ source"; return 1; }
+        # Reload + version check
+        for _pd in /opt/conda/lib/pkgconfig /opt/conda/share/pkgconfig; do
+            if [[ -f "$_pd/glib-2.0.pc" ]]; then
+                if ! _glib_pc_ver_ok "$_pd"; then
+                    local _cv
+                    _cv=$(grep "^Version:" "$_pd/glib-2.0.pc" 2>/dev/null | awk '{print $2}')
+                    echo -e "${Y}⚠${W}  conda install glib ${_cv} vẫn < ${_GLIB_MIN} — build từ source"
+                    return 1
+                fi
+                export PKG_CONFIG_PATH="$_pd:${PKG_CONFIG_PATH:-}"
+                mkdir -p "$prefix/lib/pkgconfig"
+                for _pc in "$_pd"/glib-2.0.pc "$_pd"/gobject-2.0.pc \
+                           "$_pd"/gmodule-2.0.pc "$_pd"/gio-2.0.pc; do
+                    [[ -f "$_pc" ]] && cp -f "$_pc" "$prefix/lib/pkgconfig/" 2>/dev/null || true
+                done
+                export LD_LIBRARY_PATH="/opt/conda/lib:${LD_LIBRARY_PATH:-}"
+                echo -e "${G}✔${W} glib từ conda sẵn sàng"
+                return 0
+            fi
+        done
+    fi
+    return 1  # không tìm được — caller sẽ build từ source
+}
+
+_build_glib_from_source() {
+    local prefix="$1"; local build_dir="$2"; local py_prefix="$3"
+
+    # ── Primary: build glib từ source thuần túy ─────────────────
+    # Conda KHÔNG được dùng làm nguồn chính cho glib vì:
+    #   conda glib-2.0.pc có Requires: libpcre2-8, nhưng libpcre2-8.pc
+    #   không có trong conda → QEMU meson thất bại với "libpcre2-8 not found"
+    # Conda chỉ là FALLBACK nếu source build thất bại hoàn toàn.
+
+
+    # ── Helper: build pcre2 từ source nếu chưa có ───────────────
+    _ensure_pcre2() {
+        local _ppc="$prefix/lib/pkgconfig:$prefix/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
+        # Kiểm tra pcre2 đã build chưa — dùng pkg-config nếu có, fallback kiểm tra file .pc trực tiếp
+        if command -v pkg-config &>/dev/null; then
+            PKG_CONFIG_PATH="$_ppc" pkg-config --exists libpcre2-8 2>/dev/null && return 0
+        else
+            [[ -f "$prefix/lib/pkgconfig/libpcre2-8.pc" || \
+               -f "$prefix/lib64/pkgconfig/libpcre2-8.pc" ]] && return 0
+        fi
+        _rl_step "${_RL_N:-4}" "${_RL_T:-10}" "pcre2 10.42"
+        local _p2dir="$build_dir/pcre2-src"
+        mkdir -p "$_p2dir"; cd "$_p2dir"
+        local _p2ok=0
+        for _u in \
+            "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.42/pcre2-10.42.tar.gz" \
+            "https://sourceforge.net/projects/pcre/files/pcre2/10.42/pcre2-10.42.tar.gz/download"; do
+            wget -q --no-check-certificate -O pcre2.tar.gz "$_u" 2>/dev/null \
+                && tar xzf pcre2.tar.gz 2>/dev/null && { _p2ok=1; break; }
+        done
+        [[ $_p2ok -eq 0 ]] && { echo -e "${R}✘${W} Không tải được pcre2"; return 1; }
+        cd pcre2-10.42
+        ./configure --prefix="$prefix" --enable-static --disable-shared \
+            --enable-pcre2-8 --disable-pcre2-16 --disable-pcre2-32 \
+            --disable-jit > /tmp/pcre2-build.log 2>&1 \
+            && make -j"$(nproc)" >> /tmp/pcre2-build.log 2>&1 \
+            && make install   >> /tmp/pcre2-build.log 2>&1 \
+            || { echo -e "${R}✘${W} pcre2 build thất bại — xem /tmp/pcre2-build.log"; return 1; }
+        _rl_ok "pcre2 10.42 xong"
+    }
+
+    # ── Ưu tiên 2: build glib 2.76.6 từ source ──────────────────
+    # Dùng 2.76.6 (không 2.78.x): glib 2.78+ có bug glib-enumtypes codegen
+    # với meson 1.x khi python3 trong PATH là conda python — sinh lỗi:
+    # "build/-c: not found" do meson pass PYTHON -c như single string.
+    local GLIB_VER="2.76.6"
+    local GLIB_MAJ="2.76"
+    _rl_step "${_RL_N:-5}" "${_RL_T:-10}" "glib ${GLIB_VER}"
+
+    # pcre2 là hard dep từ glib 2.73+ — đảm bảo có trước khi build
+    _ensure_pcre2 || exit 1
+
+    # ── Cache check: nếu glib đã build xong → skip ──────────────
+    if [[ -f "$prefix/lib/libglib-2.0.a" || -f "$prefix/lib/libglib-2.0.so" \
+       || -f "$prefix/lib64/libglib-2.0.a" ]]; then
+        local _cached_ver
+        _cached_ver=$(PKG_CONFIG_PATH="$prefix/lib/pkgconfig:$prefix/lib64/pkgconfig:${PKG_CONFIG_PATH:-}" \
+                      pkg-config --modversion glib-2.0 2>/dev/null || echo "?")
+        echo -e "${G}✔${W} glib ${_cached_ver} đã có trong cache ($prefix) — bỏ qua build"
+        export PKG_CONFIG_PATH="$prefix/lib/pkgconfig:$prefix/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
+        return 0
+    fi
+
+    cd "$build_dir"
+    rm -f glib.tar.xz
+    local _glib_ok=0
+    for _url in \
+        "https://download.gnome.org/sources/glib/${GLIB_MAJ}/glib-${GLIB_VER}.tar.xz" \
+        "https://ftp.gnome.org/pub/gnome/sources/glib/${GLIB_MAJ}/glib-${GLIB_VER}.tar.xz"; do
+        wget -c -q --timeout=120 --tries=2 "$_url" -O glib.tar.xz 2>/dev/null \
+            && python3 -c "import lzma; lzma.open('glib.tar.xz').read(1024)" 2>/dev/null \
+            && _glib_ok=1 && break
+        echo -e "${Y}⚠${W}  glib URL thất bại: $_url"
+    done
+    if [[ "$_glib_ok" == "0" ]]; then
+        echo -e "${R}✘${W}  Không tải được glib ${GLIB_VER} từ source."
+        echo -e "${Y}⚠${W}  Conda glib fallback bị loại bỏ: ABI mismatch với system gcc trên môi trường này."
+        echo -e "${Y}⚠${W}  Kiểm tra kết nối internet hoặc thêm mirror URL cho glib tarball."
+        exit 1
+    fi
+    python3 -c "
+import lzma, tarfile
+with lzma.open('glib.tar.xz') as f:
+    with tarfile.open(fileobj=f) as t:
+        t.extractall('.')
+" || { echo -e "${R}✘${W} Giải nén glib thất bại"; exit 1; }
+    cd "glib-${GLIB_VER}"
+    mkdir -p build; cd build
+
+    # ── Detect meson ──────────────────────────────────────────────
+    local meson_cmd=""
+    if   [[ -x "${PIP_TARGET:-}/bin/meson" ]];   then meson_cmd="${PIP_TARGET}/bin/meson"
+    elif [[ -x "$py_prefix/bin/meson" ]];         then meson_cmd="$py_prefix/bin/meson"
+    elif command -v meson &>/dev/null;             then meson_cmd="$(command -v meson)"
+    elif python3 -c "import mesonbuild" &>/dev/null 2>&1; then
+        # Tạo Python script thực — KHÔNG dùng shell -c vì meson dùng sys.argv[0]
+        # để tìm binary path → "-c" gây ra "build/-c: not found".
+        cat > /tmp/_meson_wrap.py <<'MESONPY'
+#!/usr/bin/env python3
+import sys
+from mesonbuild.mesonmain import main
+sys.exit(main())
+MESONPY
+        chmod +x /tmp/_meson_wrap.py
+        meson_cmd="/tmp/_meson_wrap.py"
+    else
+        echo -e "${R}✘${W} meson không tìm thấy — không thể build glib"; exit 1
+    fi
+    # Nếu meson_cmd là shell script dùng python3 -c "..." → replace bằng Python wrapper
+    # (conda meson hoặc pip wrapper cũ có cùng bug "build/-c: not found")
+    if [[ -f "$meson_cmd" ]] && head -3 "$meson_cmd" 2>/dev/null | grep -q "python.*-c"; then
+        python3 -c "import mesonbuild" &>/dev/null 2>&1 || \
+            PYTHONPATH="${PIP_TARGET:-}:${PYTHONPATH:-}" python3 -c "import mesonbuild" &>/dev/null 2>&1
+        if PYTHONPATH="${PIP_TARGET:-}:${PYTHONPATH:-}" python3 -c "import mesonbuild" &>/dev/null 2>&1; then
+            cat > /tmp/_meson_wrap.py <<MESONPY2
+#!/usr/bin/env python3
+import sys, os
+_pt = os.environ.get('PIP_TARGET', '${PIP_TARGET:-}')
+if _pt: sys.path.insert(0, _pt)
+from mesonbuild.mesonmain import main
+sys.exit(main())
+MESONPY2
+            chmod +x /tmp/_meson_wrap.py
+            :
+            meson_cmd="/tmp/_meson_wrap.py"
+        fi
+    fi
+
+    # ── Detect ninja ──────────────────────────────────────────────
+    local ninja_cmd=""
+    if   [[ -x "${PIP_TARGET:-}/bin/ninja" ]];   then ninja_cmd="${PIP_TARGET}/bin/ninja"
+    elif command -v ninja &>/dev/null;             then ninja_cmd="$(command -v ninja)"
+    elif command -v ninja-build &>/dev/null;       then ninja_cmd="$(command -v ninja-build)"
+    else
+        local _nj_bin
+        _nj_bin=$(find "${PIP_TARGET:-/nonexistent}" -name "ninja" -type f \
+            ! -name "*.py" ! -name "*.pyc" ! -path "*__pycache__*" 2>/dev/null | head -1 || true)
+        if [[ -n "$_nj_bin" && -x "$_nj_bin" ]]; then ninja_cmd="$_nj_bin"
+        else echo -e "${R}✘${W} ninja không tìm thấy"; exit 1; fi
+    fi
+
+
+    # Fix: khi build glib từ source, PHẢI isolate PKG_CONFIG_PATH khỏi conda.
+    # Nếu để conda path lẫn vào, pkg-config trả về glib của conda → meson so sánh
+    # sizeof(size_t) từ conda glib với system glib → mismatch → lỗi GLIB_SIZEOF_SIZE_T.
+    # Chỉ trỏ vào $prefix (libs vừa build từ source: zlib, libffi, pcre2...).
+    export PKG_CONFIG_PATH="$prefix/lib/pkgconfig:$prefix/lib64/pkgconfig"
+    # PKG_CONFIG_LIBDIR override hoàn toàn mọi default path (bao gồm cả conda)
+    export PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig:$prefix/lib64/pkgconfig"
+
+    # Đảm bảo $prefix/bin trong PATH và libs tìm được
+    export PATH="$prefix/bin:${PATH}"
+    # prefix lib trước conda lib để source-built .so được ưu tiên
+    export LD_LIBRARY_PATH="$prefix/lib:$prefix/lib64:${CONDA_ROOT:-/opt/conda}/lib:${LD_LIBRARY_PATH:-}"
+
+    # Tìm pkg-config: ưu tiên $prefix/bin (self-built), KHÔNG dùng conda pkg-config trực tiếp
+    # vì conda pkg-config có hardcoded conda paths ignore PKG_CONFIG_LIBDIR.
+    local _pc_bin=""
+    if [[ -x "$prefix/bin/pkg-config" ]] && "$prefix/bin/pkg-config" --version &>/dev/null; then
+        _pc_bin="$prefix/bin/pkg-config"
+    elif [[ -x "$(command -v pkgconf 2>/dev/null || true)" ]]; then
+        _pc_bin="$(command -v pkgconf)"
+    fi
+    # Nếu chỉ có conda pkg-config: tạo wrapper script tôn trọng PKG_CONFIG_LIBDIR
+    if [[ -z "$_pc_bin" ]] && [[ -x "${CONDA_ROOT:-/opt/conda}/bin/pkg-config" ]]; then
+        local _pc_wrapper="$prefix/bin/pkg-config"
+        mkdir -p "$prefix/bin"
+        cat > "$_pc_wrapper" <<PCWRAP
+#!/bin/sh
+exec env PKG_CONFIG_SYSTEM_LIBRARY_PATH="" \
+     ${CONDA_ROOT:-/opt/conda}/bin/pkg-config "\$@"
+PCWRAP
+        chmod +x "$_pc_wrapper"
+        _pc_bin="$_pc_wrapper"
+        :
+    fi
+    local _no_pkgconfig=0
+    if [[ -n "$_pc_bin" ]]; then
+        export PKG_CONFIG="$_pc_bin"
+        :
+        :
+    else
+        echo -e "${Y}⚠${W}  Không tìm được pkg-config hoạt động — dùng pcre2=internal fallback"
+        _no_pkgconfig=1
+    fi
+
+    # Helper: chỉ add option nếu glib version này có khai báo trong meson_options.txt
+    _has_opt() { grep -qE "option\s*\(\s*'$1'" ../meson_options.txt 2>/dev/null; }
+
+    # Flags luôn hợp lệ cho mọi glib version
+    local _meson_flags=(
+        --prefix="$prefix"
+        --buildtype=plain
+        -Dauto_features=disabled
+        -Dlibdir="lib"
+        -Dman=false
+        -Dgtk_doc=false
+        -Dlibmount=disabled
+        -Dselinux=disabled
+        -Ddtrace=false
+        -Dsystemtap=false
+        -Dlibelf=disabled
+    )
+    # Thêm options tuỳ theo glib version (tránh "Unknown option" với meson 1.11+)
+    _has_opt tests            && _meson_flags+=(-Dtests=false)
+    _has_opt installed_tests  && _meson_flags+=(-Dinstalled_tests=false)
+    _has_opt xattr            && _meson_flags+=(-Dxattr=false)
+    _has_opt nls              && _meson_flags+=(-Dnls=disabled)
+    _has_opt introspection    && _meson_flags+=(-Dintrospection=disabled)
+
+    # pcre2: nếu pkg-config hoạt động → glib tự detect qua PKG_CONFIG_PATH (pcre2 đã build từ source)
+    # nếu pkg-config KHÔNG hoạt động → dùng -Dpcre2=internal để meson tự build pcre2 từ wrap
+    if [[ "$_no_pkgconfig" == "1" ]]; then
+        _has_opt pcre2 && _meson_flags+=(-Dpcre2=internal)
+        # wrap-mode=nofallback: cho phép internal subproject nhưng không download wrap bên ngoài
+        _meson_flags+=(--wrap-mode=nofallback)
+        :
+    else
+        _has_opt pcre2 && _meson_flags+=(-Dpcre2=enabled)
+        _meson_flags+=(--wrap-mode=nodownload)
+    fi
+
+    local _meson_exit=0
+    : # meson setup
+( _hb=0; while :; do sleep 30; _hb=$((_hb+1)); printf "[~] meson setup: %d min...
+" "$((_hb/2))"; done ) &
+_HB_MESON=$!
+timeout 3600 "$meson_cmd" setup . .. "${_meson_flags[@]}" > /tmp/glib-meson.log 2>&1
+kill "$_HB_MESON" 2>/dev/null; wait "$_HB_MESON" 2>/dev/null || true
+_meson_exit=$?; :
+    if [[ $_meson_exit -eq 124 ]]; then
+        echo -e "${R}✘${W} meson setup glib TIMEOUT (>3600s) — xem /tmp/glib-meson.log"
+        tail -30 /tmp/glib-meson.log; exit 1
+    elif [[ $_meson_exit -ne 0 ]]; then
+        echo -e "${R}✘${W}  meson glib thất bại (exit $_meson_exit) — xem /tmp/glib-meson.log"
+        tail -30 /tmp/glib-meson.log
+        echo -e "${Y}⚠${W}  Conda glib fallback bị loại bỏ (ABI mismatch với system gcc)."
+        echo -e "${Y}⚠${W}  Xoá build cache và thử lại: rm -rf ~/qemu-static ~/qemu-build"
+        exit 1
+    fi
+    local _ninja_exit=0
+    :
+( _hb=0; while :; do sleep 30; _hb=$((_hb+1)); printf "[~] glib build: %d min elapsed...\n" "$((_hb/2))"; done ) &
+_HB_GLIB=$!
+timeout 900 "$ninja_cmd" -j"$(nproc)" > /tmp/glib-build.log 2>&1 || _ninja_exit=$?
+kill "$_HB_GLIB" 2>/dev/null; wait "$_HB_GLIB" 2>/dev/null || true
+:
+    if [[ $_ninja_exit -eq 124 ]]; then
+        echo -e "${R}✘${W} ninja glib TIMEOUT (>900s)"; tail -20 /tmp/glib-build.log; exit 1
+    elif [[ $_ninja_exit -ne 0 ]]; then
+        echo -e "${R}✘${W}  ninja glib thất bại — xem /tmp/glib-build.log"
+        tail -20 /tmp/glib-build.log
+        echo -e "${Y}⚠${W}  Conda glib fallback bị loại bỏ (ABI mismatch với system gcc)."
+        echo -e "${Y}⚠${W}  Xoá build cache và thử lại: rm -rf ~/qemu-static ~/qemu-build"
+        exit 1
+    fi
+    timeout 120 "$ninja_cmd" install >> /tmp/glib-build.log 2>&1 \
+        || {
+            echo -e "${R}✘${W} glib install thất bại — xem /tmp/glib-build.log"; exit 1
+        }
+    _rl_ok "glib ${GLIB_VER} xong"
+    echo "qemu" > "$BUILD/.rootless-resume"
+}
+
+# ════════════════════════════════════════════════════════════════
+#  ROOTLESS BUILD
+# ════════════════════════════════════════════════════════════════
+_detect_cross_toolchain() {
+    local _cc="${CC_PLAIN:-$(command -v gcc 2>/dev/null || command -v cc 2>/dev/null || echo "")}"
+    [[ -z "$_cc" ]] && return
+
+    local _cc_dir; _cc_dir="$(dirname "$_cc")"
+    local _cc_bn;  _cc_bn="$(basename "$_cc")"
+
+    # Add compiler bin dir to PATH so ar/ranlib/etc. can be found
+    if [[ -d "$_cc_dir" ]] && [[ ":$PATH:" != *":$_cc_dir:"* ]]; then
+        export PATH="$_cc_dir:$PATH"
+        hash -r 2>/dev/null || true
+    fi
+
+    # Derive cross-prefix (e.g. x86_64-conda-linux-gnu from x86_64-conda-linux-gnu-gcc)
+    local _cross_prefix=""
+    if [[ "$_cc_bn" == *"-gcc" ]]; then
+        _cross_prefix="${_cc_bn%-gcc}"
+    elif [[ "$_cc_bn" == *"-cc" ]]; then
+        _cross_prefix="${_cc_bn%-cc}"
+    fi
+
+    if [[ -n "$_cross_prefix" ]]; then
+        for _tool in ar ranlib nm strip; do
+            local _bin="$_cc_dir/${_cross_prefix}-${_tool}"
+            if [[ -x "$_bin" ]]; then
+                local _var="${_tool^^}"  # ar→AR, ranlib→RANLIB etc.
+                export "${_var}=${_bin}"
+                echo -e "${G}✔${W} Cross-toolchain ${_var}=${_bin}"
+            fi
+        done
+    fi
+
+    # Last-resort: if ar still not found, search conda envs
+    if ! command -v "${AR:-ar}" &>/dev/null; then
+        local _found_ar
+        _found_ar=$(find /opt/conda/bin /opt/conda/envs/*/bin -maxdepth 1 \
+            -name "*-ar" -o -name "ar" 2>/dev/null | head -1)
+        if [[ -n "$_found_ar" ]]; then
+            export AR="$_found_ar"
+            echo -e "${G}✔${W} AR (fallback search): $AR"
+        fi
+    fi
+
+    :
+}
+
+_qemu_build_tuning() {
+    local _cc_hint="${CC_PLAIN:-${CC:-$(command -v gcc 2>/dev/null || command -v cc 2>/dev/null || echo "")}}"
+    local _cc_ver=""
+    local _is_clang=0
+    local _lto_flags=""
+    local _lto_ldflags=""
+    local _lto_note=""
+
+    if [[ -n "$_cc_hint" ]]; then
+        if [[ "$_cc_hint" == *" "* ]]; then
+            _cc_ver=$(bash -lc "set -o pipefail; $_cc_hint --version 2>/dev/null | head -1" 2>/dev/null || true)
+        else
+            _cc_ver=$("$_cc_hint" --version 2>/dev/null | head -1 || true)
+        fi
+    fi
+
+    if [[ "$_cc_ver" == *clang* || "$_cc_ver" == *"Apple clang"* ]]; then
+        _is_clang=1
+    fi
+
+    # -ffast-math: nới lỏng IEEE 754 để tối ưu FP ops trong TCG/FPU emulation
+    # Đặt NO_FAST_MATH=1 để tắt nếu cần IEEE 754 chính xác tuyệt đối
+    local _fast_math_flag=""
+    if [[ "${NO_FAST_MATH:-0}" != "1" ]]; then
+        _fast_math_flag=" -ffast-math"
+    fi
+
+    PGO_PROFILE_KIND="gcc"
+    [[ "$_is_clang" == "1" ]] && PGO_PROFILE_KIND="clang"
+
+    QEMU_BASE_CFLAGS="-O3 -march=native -mtune=native -pipe -fno-plt -fno-semantic-interposition -fomit-frame-pointer -fstack-protector-strong -ffunction-sections -fdata-sections -fipa-cp-clone -fgcse-after-reload -fweb -falign-functions=32 -falign-loops=32 -falign-jumps=32 -falign-labels=32 -fmerge-all-constants -fipa-pta${_fast_math_flag}"
+    QEMU_BASE_CXXFLAGS="$QEMU_BASE_CFLAGS"
+
+    # LLVM BOLT requires --emit-relocs, which conflicts with --gc-sections.
+    # When BOLT is available, replace gc-sections with emit-relocs.
+    local _bolt_active=0
+    if _bolt_check_tools 2>/dev/null; then
+        _bolt_active=1
+        QEMU_BASE_LDFLAGS="-Wl,-O1 -Wl,--as-needed -Wl,--emit-relocs"
+    else
+        QEMU_BASE_LDFLAGS="-Wl,-O1 -Wl,--as-needed -Wl,--gc-sections"
+    fi
+    QEMU_CONFIGURE_LTO_OPT=""
+
+    PGO_LAUNCH_ENV=""
+    local _pgo_cflags="" _pgo_cxxflags="" _pgo_ldflags=""
+
+    if [[ "${PGO_MODE:-0}" == "1" && "${PGO_PHASE:-normal}" != "normal" ]]; then
+        case "${PGO_PHASE:-}" in
+            generate)
+                if [[ "$PGO_PROFILE_KIND" == "clang" ]]; then
+                    _pgo_cflags="-fprofile-instr-generate=${PGO_PROFILE_DIR}"
+                    _pgo_cxxflags="-fprofile-instr-generate=${PGO_PROFILE_DIR}"
+                    _pgo_ldflags="-fprofile-instr-generate=${PGO_PROFILE_DIR}"
+                    PGO_LAUNCH_ENV="env LLVM_PROFILE_FILE=${PGO_PROFILE_DIR}/%p-%m.profraw"
+                else
+                    # gcc: trailing slash bắt buộc — không có → tất cả .gcda ghi
+                    # cùng một prefix thay vì vào thư mục, profile corrupt/trống
+                    mkdir -p "${PGO_PROFILE_DIR}"
+                    _pgo_cflags="-fprofile-generate=${PGO_PROFILE_DIR}/"
+                    _pgo_cxxflags="-fprofile-generate=${PGO_PROFILE_DIR}/"
+                    _pgo_ldflags="-fprofile-generate=${PGO_PROFILE_DIR}/"
+                fi
+                # Generate phase không có LTO → mất cross-unit inlining → TCG chậm hơn bình thường.
+                # Bù lại bằng explicit inlining flags để giữ performance gần với normal build.
+                if [[ "$PGO_PROFILE_KIND" == "gcc" ]]; then
+                    _pgo_cflags+=" -finline-functions -finline-limit=1000 --param max-inline-insns-auto=200"
+                    _pgo_cxxflags+=" -finline-functions -finline-limit=1000 --param max-inline-insns-auto=200"
+                else
+                    # clang: dùng -mllvm để pass inliner threshold
+                    _pgo_cflags+=" -mllvm -inline-threshold=500"
+                    _pgo_cxxflags+=" -mllvm -inline-threshold=500"
+                fi
+                ;;
+            use)
+                if [[ "$PGO_PROFILE_KIND" == "clang" ]]; then
+                    _pgo_cflags="-fprofile-instr-use=${PGO_PROFILE_DIR}/default.profdata"
+                    _pgo_cxxflags="-fprofile-instr-use=${PGO_PROFILE_DIR}/default.profdata"
+                    _pgo_ldflags="-fprofile-instr-use=${PGO_PROFILE_DIR}/default.profdata"
+                else
+                    # -fprofile-correction: xử lý khi build dir use phase khác generate phase
+                    # (GCC embed absolute path vào .gcda → path mismatch nếu build dir đổi)
+                    # -Wno-missing-profile: suppress warning khi một số .gcda không tìm thấy
+                    # (bình thường — không phải mọi TU đều được exercise trong generate phase)
+                    # -Wno-error=coverage-mismatch: profile từ version QEMU khác → counter count
+                    # không khớp, treat as warning thay vì error để build vẫn tiếp tục
+                    _pgo_cflags="-fprofile-use=${PGO_PROFILE_DIR} -fprofile-correction -fprofile-partial-training -Wno-missing-profile -Wno-error=coverage-mismatch"
+                    _pgo_cxxflags="-fprofile-use=${PGO_PROFILE_DIR} -fprofile-correction -fprofile-partial-training -Wno-missing-profile -Wno-error=coverage-mismatch"
+                    _pgo_ldflags="-fprofile-use=${PGO_PROFILE_DIR}"
+                fi
+                ;;
+        esac
+        QEMU_BASE_CFLAGS+=" ${_pgo_cflags}"
+        QEMU_BASE_CXXFLAGS+=" ${_pgo_cxxflags}"
+        QEMU_BASE_LDFLAGS+=" ${_pgo_ldflags}"
+    fi
+
+    # PGO generate phase: tắt LTO bắt buộc.
+    # -fprofile-generate + -flto không tương thích trong QEMU multi-target build:
+    # mỗi TCG target là separate shared object, LTO IR không carry instrumentation
+    # counters qua link boundary → .gcda/.profraw không được ghi → profile trống.
+    # LTO chỉ bật ở phase 'use' (build cuối với profile đã có).
+    local _pgo_is_generating=0
+    if [[ "${PGO_MODE:-0}" == "1" && "${PGO_PHASE:-normal}" == "generate" ]]; then
+        _pgo_is_generating=1
+    fi
+
+    if [[ "${NO_LTO:-0}" == "1" || "$_pgo_is_generating" == "1" ]]; then
+        if [[ "$_pgo_is_generating" == "1" ]]; then
+            _lto_note="LTO disabled (PGO generate phase — re-enabled in use phase)"
+        else
+            _lto_note="LTO disabled (NO_LTO=1)"
+        fi
+    elif [[ "$_is_clang" == "1" ]]; then
+        _lto_flags="-flto"
+        _lto_ldflags="-flto"
+        if command -v ld.lld &>/dev/null; then
+            _lto_ldflags="-flto -fuse-ld=lld"
+        fi
+        QEMU_CONFIGURE_LTO_OPT="--enable-lto"
+        for _tool in ar ranlib nm; do
+            local _cand
+            _cand="$(command -v llvm-$_tool 2>/dev/null || true)"
+            [[ -n "$_cand" ]] && export "${_tool^^}=$_cand"
+        done
+        _lto_note="Full LTO enabled (clang)"
+    else
+        _lto_flags="-flto"
+        _lto_ldflags="-flto"
+        QEMU_CONFIGURE_LTO_OPT="--enable-lto"
+
+        local _tool_prefix=""
+        if [[ "$_cc_hint" == *-gcc ]]; then
+            _tool_prefix="${_cc_hint%-gcc}"
+        fi
+
+        if [[ -n "$_tool_prefix" ]]; then
+            for _tool in ar ranlib nm; do
+                local _cand=""
+                for _name in "${_tool_prefix}-gcc-${_tool}" "gcc-${_tool}"; do
+                    _cand="$(command -v "$_name" 2>/dev/null || true)"
+                    [[ -n "$_cand" ]] && break
+                done
+                [[ -n "$_cand" ]] && export "${_tool^^}=$_cand"
+            done
+        else
+            for _tool in ar ranlib nm; do
+                local _cand=""
+                _cand="$(command -v "gcc-${_tool}" 2>/dev/null || true)"
+                [[ -n "$_cand" ]] && export "${_tool^^}=$_cand"
+            done
+        fi
+        _lto_note="Full LTO enabled (gcc)"
+    fi
+
+    QEMU_BASE_CFLAGS+=" ${_lto_flags}"
+    QEMU_BASE_CXXFLAGS+=" ${_lto_flags}"
+    QEMU_BASE_LDFLAGS+=" ${_lto_ldflags}"
+
+    export QEMU_BASE_CFLAGS QEMU_BASE_CXXFLAGS QEMU_BASE_LDFLAGS QEMU_CONFIGURE_LTO_OPT PGO_LAUNCH_ENV PGO_PROFILE_KIND
+    if [[ "${NO_FAST_MATH:-0}" != "1" ]]; then
+        _rl_ok "fast-math: BẬT (-ffast-math) [tắt: NO_FAST_MATH=1]"
+    else
+        _rl_warn "fast-math: TẮT (NO_FAST_MATH=1) — IEEE 754 chính xác"
+    fi
+    if [[ "$_bolt_active" == "1" ]]; then
+        _rl_ok "LLVM BOLT: --emit-relocs ENABLED (replace --gc-sections)"
+    fi
+    :
+    :
+    :
+}
+
+
 _rootless_build() {
     local ROOTLESS_PREFIX="$HOME/qemu-static"
     local ROOTLESS_BIN_DIR="$ROOTLESS_PREFIX/bin"
@@ -1259,7 +2100,8 @@ _rootless_build() {
         local _dest="$1"
         local _ok=0
         local _urls=(
-            "https://github.com/pkgforge-dev/QEMU-AppImage/releases/download/11.1.0-1%402026-08-22_1787393927/QEMU-11.1.0-1-anylinux-x86_64.AppImage"
+            "https://github.com/pkgforge-dev/QEMU-AppImage/releases/download/11.0.0-1%402026-05-02_1777749420/QEMU-11.0.0-1-anylinux-x86_64.AppImage"
+            "https://github.com/lucasmz1/Qemu-AppImage/releases/download/continuous-stable-jammy/QEMU-git-x86_64.AppImage"
         )
         mkdir -p "$ROOTLESS_APPIMAGE_DIR" "$ROOTLESS_LOG_DIR"
         for _url in "${_urls[@]}"; do
@@ -1283,15 +2125,6 @@ _rootless_build() {
             fi
             if [[ "$_ok" == "1" ]] && [[ -s "$_dest" ]]; then
                 chmod +x "$_dest" 2>/dev/null || true
-                # Kiểm tra nếu tải được tar.xz
-                if [[ "$_dest" == *.tar ]] && command -v tar &>/dev/null; then
-                    local _extracted_dir=$(mktemp -d)
-                    tar -xf "$_dest" -C "$_extracted_dir" --strip-components=1
-                    chmod +x "$_extracted_dir/AppRun" 2>/dev/null || true
-                    timeout 20 "$_extracted_dir/AppRun" --version >/tmp/qemu-appimage-download.log 2>&1 && \
-                        cp -r "$_extracted_dir" "$_dest" && rm -rf "$_extracted_dir" && return 0
-                    rm -rf "$_extracted_dir"
-                fi
                 timeout 20 "$_dest" --appimage-extract-and-run qemu-system-x86_64 --version >/tmp/qemu-appimage-download.log 2>&1 && return 0
                 rm -f "$_dest"
             fi
@@ -1471,7 +2304,6 @@ _start_parallel_download() {
     if ! command -v aria2c &>/dev/null; then
         _ensure_aria2 || true
     fi
-    mkdir -p "$(dirname "${WIN_IMG_PATH:-win.img}")" 2>/dev/null || true
     if command -v aria2c &>/dev/null; then
         nohup aria2c "${ARIA2_OPTS[@]}" \
             --summary-interval=30 \
@@ -1480,19 +2312,9 @@ _start_parallel_download() {
     else
         nohup wget --progress=dot:giga --continue             "$WIN_URL" -O "${WIN_IMG_PATH:-win.img}"             > /tmp/dl-parallel.log 2>&1 &
     fi
-    local _pid=$!
-    disown "$_pid" 2>/dev/null || true
-    # Xác nhận tiến trình còn sống trước khi coi là "đã bắt đầu" —
-    # tránh trường hợp aria2c/wget chết ngay (binary vừa cài, PATH/thư mục
-    # chưa sẵn sàng) khiến bước verify sau này báo sai "download thiếu".
-    sleep 0.4
-    if kill -0 "$_pid" 2>/dev/null; then
-        IMG_DL_PID="$_pid"
-        echo -e "${G}✔${W} Download bắt đầu nền (PID: $IMG_DL_PID)"
-    else
-        IMG_DL_PID=""
-        echo -e "${Y}⚠${W}  Tải nền không khởi động được — sẽ tải tuần tự bình thường sau"
-    fi
+    IMG_DL_PID=$!
+    disown "$IMG_DL_PID" 2>/dev/null || true
+    echo -e "${G}✔${W} Download bắt đầu nền (PID: $IMG_DL_PID)"
 }
 
 # ── Đợi download nền nếu chưa xong ──────────────────────────────
@@ -1514,16 +2336,14 @@ _wait_parallel_download() {
     wait "$IMG_DL_PID" 2>/dev/null || true
     IMG_DL_PID=""
     local _wimg="${WIN_IMG_PATH:-win.img}"
-    local _actual0; _actual0=$(stat -c%s "$_wimg" 2>/dev/null || echo 0)
 
-    # Verify against expected Content-Length nếu có — chỉ cảnh báo khi thực
-    # sự có dữ liệu dở dang (>0 byte); 0 byte nghĩa là tải nền chưa kịp ghi
-    # gì cả, sẽ được tải tuần tự bình thường ở bước sau nên không cần báo.
-    if [[ -n "${WIN_URL:-}" && "$_actual0" -gt 0 ]]; then
+    # Verify against expected Content-Length nếu có
+    if [[ -n "${WIN_URL:-}" ]]; then
         local _expected; _expected=$(_img_expected_size "$WIN_URL" 2>/dev/null || echo 0)
-        if [[ "$_expected" -gt 1048576 && "$_actual0" -lt "$_expected" ]]; then
-            local _diff=$(( _expected - _actual0 ))
-            echo -e "${Y}⚠${W}  File nhỏ hơn Content-Length: ${_actual0} vs ${_expected} (thiếu ${_diff} bytes) — tải lại"
+        local _actual; _actual=$(stat -c%s "$_wimg" 2>/dev/null || echo 0)
+        if [[ "$_expected" -gt 1048576 && "$_actual" -lt "$_expected" ]]; then
+            local _diff=$(( _expected - _actual ))
+            echo -e "${Y}⚠${W}  File nhỏ hơn Content-Length: ${_actual} vs ${_expected} (thiếu ${_diff} bytes) — tải lại"
             rm -f "$_wimg" 2>/dev/null || true
         fi
     fi
@@ -1539,8 +2359,6 @@ _wait_parallel_download() {
         else
             echo -e "${Y}⚠${W}  File nhỏ hơn 2GB (${SZ_BYTES} bytes) — có thể chưa xong: /tmp/dl-parallel.log"
         fi
-    elif [[ "$_actual0" -eq 0 ]]; then
-        : # Tải nền chưa kịp bắt đầu ghi file — im lặng, sequential download sẽ lo tiếp
     else
         echo -e "${Y}⚠${W}  Download chưa hoàn tất — kiểm tra /tmp/dl-parallel.log"
     fi
@@ -1956,8 +2774,12 @@ _iso_mode_run() {
     else
         echo -e "${Y}⚠${W}  KVM không có — dùng TCG software emulation"
 
-        # ── TCG TB cache (fixed 4096MB) ─────────────────────────────
-        _tcg_tb_mb=4096
+        # ── TCG TB cache ──────────────────────────────────────────
+        local _host_ram_iso; _host_ram_iso=$(awk '/MemTotal/{printf "%.0f",$2/1024/1024}' /proc/meminfo 2>/dev/null || echo 4)
+        [[ "${_host_ram_iso:-0}" -lt 1 ]] && _host_ram_iso=4
+        _tcg_tb_mb=$(( _host_ram_iso * 1024 * 6 / 100 ))
+        [[ "$_tcg_tb_mb" -lt 4096   ]] && _tcg_tb_mb=4096
+        [[ "$_tcg_tb_mb" -gt 8192 ]] && _tcg_tb_mb=8192
         _kvm_accel_args=(-accel "tcg,thread=multi,split-wx=off,one-insn-per-tb=off,tb-size=${_tcg_tb_mb}")
         echo -e "${G}⚡ TCG TB cache: ${_tcg_tb_mb}MB | multi-thread${W}"
 
@@ -2206,32 +3028,116 @@ case "$main_choice" in
     ;;
 esac
 
-# Case 1 falls through — tiếp tục tải AppImage/download
+# Case 1 falls through — tiếp tục build/download
 _ask_win_image_early
 WIN_IMG_PATH="${ORIGINAL_DIR:-$(pwd)}/win.img"
 export WIN_IMG_PATH
 
-# ════════════════════════════════════════════════════════════════
-#  QEMU ACQUISITION — AppImage prebuilt only (root + rootless như nhau)
-#  Không còn build từ source: chỉ resolve AppImage đã có, hoặc tải mới.
-# ════════════════════════════════════════════════════════════════
-_detect_existing_qemu() {
-    # Ưu tiên AppImage QEMU 11.x trước
-    local _appimg_path=""
-    _appimg_path="$(_resolve_qemu_appimage 2>/dev/null || echo '')"
-    if [[ -n "$_appimg_path" && -x "$_appimg_path" ]]; then
-        local _app_ver
-        _app_ver=$(timeout 10 "$_appimg_path" --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "unknown")
-        if [[ "$_app_ver" == 11.* ]] || [[ "$_app_ver" == unknown ]]; then
-            echo -e "${G}⚡ QEMU 11 AppImage backend: $_appimg_path (v$_app_ver)${W}"
-            export QEMU_BIN="$_appimg_path"
-            export PATH="$(dirname "$_appimg_path"):$PATH"
-            echo -e "${G}✔${W} QEMU AppImage backend: ${B}QEMU 11.x${W} (${_app_ver:-unknown})"
-            echo -e "${G}✔${W} TCG available: ${B}yes${W} (TCG works without /dev/kvm)"
-            echo -e "${G}✔${W} LTO/-O3 optimized: ${B}baked-in${W} (prebuilt AppImage)"
-            return 0
+# ── Auto PGO use phase cho Windows 11 (choice=3), không cần --pgo flag ──────
+# Tự động tải profile từ archive.org và build use phase. Nếu tải thất bại →
+# tiếp tục bình thường (non-PGO), không block.
+# NGOẠI LỆ: KVM available → bỏ qua PGO + build hoàn toàn, dùng AppImage
+if [[ "${win_choice:-}" == "3" && "${PGO_MODE:-0}" == "0" && "${KVM_AVAILABLE:-0}" == "0" ]]; then
+    _AUTO_PGO_KEY="win11pgo"
+    _AUTO_PGO_ROOT="${WINBOX_PGO_DIR:-$ORIGINAL_PWD}"
+    _AUTO_PGO_ARCHIVE="$_AUTO_PGO_ROOT/${_AUTO_PGO_KEY}.tar.gz"
+    _AUTO_PGO_DIR="$_AUTO_PGO_ROOT/$_AUTO_PGO_KEY"
+    _AUTO_PGO_URL="https://archive.org/download/win11pgo.tar/win11pgo.tar.gz"
+    _auto_pgo_ok=0
+
+    # Dùng archive local nếu đã có sẵn
+    if [[ -f "$_AUTO_PGO_ARCHIVE" ]] \
+        && [[ $(stat -c%s "$_AUTO_PGO_ARCHIVE" 2>/dev/null || echo 0) -gt 1024 ]] \
+        && tar -tzf "$_AUTO_PGO_ARCHIVE" >/dev/null 2>&1; then
+        echo -e "${G}✔${W}  PGO profile Win11 đã có local: $_AUTO_PGO_ARCHIVE"
+        _auto_pgo_ok=1
+    else
+        echo -e "${B}ℹ${W}  Tải PGO profile Win11 từ: $_AUTO_PGO_URL"
+        _dl_ok=0
+        if command -v aria2c &>/dev/null; then
+            aria2c "${ARIA2_OPTS[@]}" \
+                "$_AUTO_PGO_URL" -d "$_AUTO_PGO_ROOT" -o "${_AUTO_PGO_KEY}.tar.gz" && _dl_ok=1
+        elif command -v wget &>/dev/null; then
+            wget -q --show-progress --continue "$_AUTO_PGO_URL" -O "$_AUTO_PGO_ARCHIVE" && _dl_ok=1
+        elif command -v curl &>/dev/null; then
+            curl -fL --progress-bar "$_AUTO_PGO_URL" -o "$_AUTO_PGO_ARCHIVE" && _dl_ok=1
+        fi
+        if [[ "$_dl_ok" == "1" ]] \
+            && [[ -f "$_AUTO_PGO_ARCHIVE" ]] \
+            && [[ $(stat -c%s "$_AUTO_PGO_ARCHIVE" 2>/dev/null || echo 0) -gt 1024 ]] \
+            && tar -tzf "$_AUTO_PGO_ARCHIVE" >/dev/null 2>&1; then
+            echo -e "${G}✔${W}  PGO profile Win11 tải xong"
+            _auto_pgo_ok=1
+        else
+            echo -e "${Y}⚠${W}  Tải PGO profile thất bại — chạy QEMU không PGO"
+            rm -f "$_AUTO_PGO_ARCHIVE" 2>/dev/null || true
         fi
     fi
+
+    if [[ "$_auto_pgo_ok" == "1" ]]; then
+        rm -rf "$_AUTO_PGO_DIR"
+        if tar -xzf "$_AUTO_PGO_ARCHIVE" -C "$_AUTO_PGO_ROOT" >/dev/null 2>&1; then
+            echo -e "${G}✔${W}  PGO profile giải nén xong → build use phase"
+            PGO_MODE=1
+            PGO_PHASE="use"
+            PGO_PROFILE_READY=1
+            PGO_PROFILE_KEY="$_AUTO_PGO_KEY"
+            PGO_PROFILE_ROOT="$_AUTO_PGO_ROOT"
+            PGO_PROFILE_DIR="$_AUTO_PGO_DIR"
+            PGO_PROFILE_ARCHIVE="$_AUTO_PGO_ARCHIVE"
+            PGO_PROFILE_KIND="gcc"
+            PGO_LAUNCH_ENV=""
+            export PGO_MODE PGO_PHASE PGO_PROFILE_READY PGO_PROFILE_KEY \
+                   PGO_PROFILE_ROOT PGO_PROFILE_DIR PGO_PROFILE_ARCHIVE \
+                   PGO_PROFILE_KIND PGO_LAUNCH_ENV
+            # Chỉ force rebuild nếu chưa có QEMU nào
+            _pgo_qemu_exists=0
+            for _pq in "$OPT_QEMU" "$HOME_QEMU" "$ROOTLESS_QEMU" \
+                       "$(command -v qemu-system-x86_64 2>/dev/null)"; do
+                [[ -n "$_pq" && -x "$_pq" ]] && { _pgo_qemu_exists=1; break; }
+            done
+            if [[ "$_pgo_qemu_exists" == "0" ]]; then
+                AUTO_BUILD="yes"
+                echo -e "${B}ℹ${W}  PGO use phase: chưa có QEMU → sẽ build với Win11 profile"
+            else
+                echo -e "${G}✔${W}  PGO use phase: QEMU đã có → bỏ qua rebuild"
+            fi
+        else
+            echo -e "${Y}⚠${W}  Giải nén PGO profile thất bại — chạy không PGO"
+        fi
+    fi
+fi
+# ─────────────────────────────────────────────────────────────────────────────
+
+if [[ "$PGO_MODE" == "1" ]]; then
+    _pgo_prepare_context "${win_choice:-5}"
+    if [[ "$PGO_PROFILE_READY" == "1" ]]; then
+        PGO_PHASE="use"
+        echo -e "${G}✔${W} PGO profile đã có cho ${PGO_PROFILE_KEY}: ${PGO_PROFILE_ARCHIVE}"
+        echo -e "${B}ℹ${W}  Sẽ build QEMU với profile này, không generate lại."
+    else
+        PGO_PHASE="generate"
+        mkdir -p "$PGO_PROFILE_DIR"
+        echo -e "${B}ℹ${W}  PGO profile chưa có cho ${PGO_PROFILE_KEY}."
+        echo -e "${B}ℹ${W}  File sẽ được lưu tại: ${PGO_PROFILE_ARCHIVE}"
+    fi
+    export PGO_PHASE PGO_PROFILE_ROOT PGO_PROFILE_KEY PGO_PROFILE_DIR PGO_PROFILE_ARCHIVE PGO_PROFILE_READY PGO_PROFILE_KIND PGO_LAUNCH_ENV
+fi
+
+# PGO use phase: chỉ rebuild nếu chưa có QEMU
+if [[ "${PGO_MODE:-0}" == "1" && "${PGO_PHASE:-}" == "use" && "$AUTO_BUILD" != "yes" ]]; then
+    _pgo_qemu_exists=0
+    for _pq in "$OPT_QEMU" "$HOME_QEMU" "$ROOTLESS_QEMU" \
+               "$(command -v qemu-system-x86_64 2>/dev/null)"; do
+        [[ -n "$_pq" && -x "$_pq" ]] && { _pgo_qemu_exists=1; break; }
+    done
+    if [[ "$_pgo_qemu_exists" == "0" ]]; then
+        AUTO_BUILD="yes"
+        echo -e "${B}ℹ${W}  PGO use phase: chưa có QEMU → sẽ build với profile đã lưu"
+    fi
+fi
+
+_detect_existing_qemu() {
     for q in "$OPT_QEMU" "$HOME_QEMU" "$ROOTLESS_QEMU" "$QEMU_BIN" \
               "$(command -v qemu-system-x86_64 2>/dev/null)"; do
         if [[ -n "$q" && -x "$q" ]]; then
@@ -2240,41 +3146,455 @@ _detect_existing_qemu() {
             echo -e "${G}⚡ Tìm thấy QEMU v${qv} tại: $q${W}"
             export QEMU_BIN="$q"
             export PATH="$(dirname "$q"):$PATH"
+            [[ "$q" == "$OPT_QEMU" || "$q" == "$HOME_QEMU" ]] && export QEMU_BUILT_BIN="$q"
             return 0
         fi
     done
     return 1
 }
 
-echo ""
-echo -e "${C}════════════════════════════════════${W}"
-echo -e "${C}⚡ QEMU AppImage (prebuilt)${W}"
-echo -e "${C}════════════════════════════════════${W}"
+# ── KVM FAST PATH: có KVM → bỏ qua build/PGO, dùng AppImage ─────────────────
+# Lý do: KVM cho tốc độ hardware virtualization, PGO TCG optimization không cần thiết.
+# AppImage nhanh hơn nhiều so với build from source (tải ~150MB vs build 10-20 phút).
+if [[ "${KVM_AVAILABLE:-0}" == "1" && "$AUTO_BUILD" != "yes" ]]; then
+    echo ""
+    echo -e "${C}════════════════════════════════════${W}"
+    echo -e "${C}⚡ KVM DETECTED — AppImage fast path${W}"
+    echo -e "${C}════════════════════════════════════${W}"
+    echo -e "${G}✔${W}  KVM có sẵn → không cần build QEMU từ source hay PGO"
+    echo -e "${B}ℹ${W}  Dùng QEMU AppImage prebuilt (nhanh hơn, KVM hardware acceleration)"
 
-if _detect_existing_qemu && [[ "$AUTO_BUILD" != "yes" ]]; then
+    # Cancel PGO nếu đã được set bởi auto-PGO Win11
+    if [[ "${PGO_MODE:-0}" == "1" ]]; then
+        PGO_MODE=0
+        PGO_PHASE=""
+        AUTO_BUILD="no"
+        export PGO_MODE PGO_PHASE
+        echo -e "${B}ℹ${W}  PGO bị hủy — KVM không cần TCG optimization"
+    fi
+
+    # Kiểm tra AppImage đã có chưa
+    _KVM_ROOTLESS_QEMU="$HOME/qemu-static/bin/qemu-system-x86_64"
+    _KVM_APPIMAGE="$HOME/qemu-static/share/qemu-appimage/QEMU-x86_64.AppImage"
+
+    if [[ -x "$_KVM_ROOTLESS_QEMU" ]] && [[ -f "$_KVM_APPIMAGE" ]]; then
+        _rv=$("$_KVM_ROOTLESS_QEMU" --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "unknown")
+        echo -e "${G}✔${W}  QEMU AppImage v${_rv} đã có — bỏ qua tải"
+        export QEMU_BIN="$_KVM_ROOTLESS_QEMU"
+        export PATH="$HOME/qemu-static/bin:$PATH"
+        export LD_LIBRARY_PATH="$HOME/qemu-static/lib:$HOME/qemu-static/lib64:${LD_LIBRARY_PATH:-}"
+        export PREFIX="$HOME/qemu-static"
+    else
+        echo -e "${B}ℹ${W}  Tải QEMU AppImage..."
+        WIN_IMG_PATH="${ORIGINAL_DIR:-$(pwd)}/win.img"
+        _start_parallel_download
+        [[ -n "$IMG_DL_PID" ]] && echo -e "${B}ℹ${W}  🔀 Tải Windows image song song với AppImage (PID: $IMG_DL_PID)"
+        _rootless_build
+    fi
+
+    _wait_parallel_download
+    choice="n"   # skip build block hoàn toàn
+    echo -e "${G}✔${W}  QEMU AppImage sẵn sàng với KVM acceleration"
+    echo -e "${C}════════════════════════════════════${W}"
+    echo ""
+fi
+# ─────────────────────────────────────────────────────────────────────────────
+
+if [[ "${choice:-}" != "n" ]]; then
+
+if _detect_existing_qemu; then
     QEMU_VER=$("$QEMU_BIN" --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "?")
-    echo -e "${G}✔${W} QEMU v${QEMU_VER} đã có — bỏ qua tải (dùng --rebuild để tải lại)"
-    WIN_IMG_PATH="${ORIGINAL_DIR:-$(pwd)}/win.img"
-    _start_parallel_download
-    [[ -n "${IMG_DL_PID:-}" ]] && echo -e "${B}ℹ${W}  🔀 Tải Windows image song song (PID: $IMG_DL_PID)"
-elif [[ "$AUTO_BUILD" == "no" ]]; then
-    echo -e "${Y}⚠${W}  --no-build: bỏ qua tải QEMU AppImage (có thể lỗi nếu chưa có QEMU)"
-    _start_parallel_download
+    if [[ "$AUTO_BUILD" == "yes" ]]; then
+        choice="y"
+        echo -e "${Y}⚠${W}  --rebuild: build lại QEMU v${QEMU_VER}"
+    elif [[ "$AUTO_BUILD" == "no" || "$AUTO_MODE" == "1" ]]; then
+        choice="n"
+        echo -e "${G}✔${W} QEMU v${QEMU_VER} đã có — bỏ qua build (dùng --rebuild để build lại)"
+    else
+        echo -e "${G}✔${W} QEMU v${QEMU_VER} đã có — bỏ qua build"
+        echo -e "${B}ℹ${W}  Dùng --rebuild nếu muốn build lại"
+        choice="n"
+    fi
 else
-    echo -e "${B}ℹ${W}  Tải QEMU AppImage prebuilt..."
-    WIN_IMG_PATH="${ORIGINAL_DIR:-$(pwd)}/win.img"
-    _start_parallel_download
-    [[ -n "${IMG_DL_PID:-}" ]] && echo -e "${B}ℹ${W}  🔀 Tải Windows image song song với AppImage (PID: $IMG_DL_PID)"
-    _rootless_build
+    if [[ "$AUTO_BUILD" == "no" ]]; then
+        choice="n"
+        echo -e "${Y}⚠${W}  --no-build: bỏ qua build (QEMU chưa có, có thể lỗi)"
+    elif [[ "$AUTO_MODE" == "1" || "$AUTO_BUILD" == "yes" ]]; then
+        choice="y"
+        echo -e "${G}🤖 Chưa có QEMU — tiến hành build${W}"
+    else
+        choice=$(ask "👉 Chưa tìm thấy QEMU. Build ngay không? (y/n): " "y")
+    fi
 fi
 
-_wait_parallel_download
+fi  # end if choice != n
 
-echo -e "${G}✔${W}  QEMU AppImage sẵn sàng${W}"
-echo -e "${C}════════════════════════════════════${W}"
-echo ""
+if [[ "$choice" == "y" ]]; then
 
-# Đảm bảo bin dir của QEMU_BIN luôn có trong PATH
+    if [[ "$ROOTLESS" == "1" ]]; then
+        # Bắt đầu tải image nền TRƯỚC khi build để tối đa hoá parallelism
+        # (rootless mode dùng AppImage, thường nhanh hơn source build)
+        WIN_IMG_PATH="${ORIGINAL_DIR:-$(pwd)}/win.img"
+        _start_parallel_download
+        [[ -n "$IMG_DL_PID" ]] && echo -e "${B}ℹ${W}  🔀 Tải image song song với rootless AppImage (PID: $IMG_DL_PID)"
+        _rootless_build
+    elif [[ -x "/opt/qemu-optimized/bin/qemu-system-x86_64" && "$AUTO_BUILD" != "yes" ]]; then
+        BUILT_VER=$("/opt/qemu-optimized/bin/qemu-system-x86_64" --version 2>/dev/null \
+            | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "unknown")
+        echo -e "${G}⚡ QEMU v${BUILT_VER} đã có tại /opt/qemu-optimized — bỏ qua build${W}"
+        echo -e "${B}ℹ${W}  Dùng --rebuild để build lại"
+        export QEMU_BIN="/opt/qemu-optimized/bin/qemu-system-x86_64"
+        export PATH="/opt/qemu-optimized/bin:$PATH"
+        export LD_LIBRARY_PATH="/opt/qemu-optimized/lib:${LD_LIBRARY_PATH:-}"
+    elif [[ -x "$HOME/qemu-optimized/bin/qemu-system-x86_64" && "$AUTO_BUILD" != "yes" ]]; then
+        BUILT_VER=$("$HOME/qemu-optimized/bin/qemu-system-x86_64" --version 2>/dev/null \
+            | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "unknown")
+        echo -e "${G}⚡ QEMU v${BUILT_VER} đã có tại ~/qemu-optimized — bỏ qua build${W}"
+        export QEMU_BIN="$HOME/qemu-optimized/bin/qemu-system-x86_64"
+        export PATH="$HOME/qemu-optimized/bin:$PATH"
+    elif [[ -x "$QEMU_BIN" && "$AUTO_BUILD" != "yes" ]]; then
+        BUILT_VER=$("$QEMU_BIN" --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "unknown")
+        echo -e "${G}⚡ QEMU v${BUILT_VER} đã tồn tại — bỏ qua build${W}"
+        export PATH="/opt/qemu-optimized/bin:$PATH"
+    else
+        echo ""
+        $APT_CMD update -qq > /dev/null 2>&1
+
+        DEPS=(
+            "lsb-release|lsb-release|lsb_release"
+            "wget|wget|wget"
+            "gnupg|gnupg|gpg"
+            "build-essential|build-essential|gcc"
+            "ninja-build|ninja-build|ninja"
+            "git|git|git"
+            "python3-venv|python3-venv|python3"
+            "python3-pip|python3-pip|pip3"
+            "pkg-config|pkg-config|pkg-config"
+            "aria2|aria2|aria2c"
+            "ovmf|ovmf|"
+            "libglib2.0-dev|libglib2.0-dev|"
+            "libpixman-1-dev|libpixman-1-dev|"
+            "zlib1g-dev|zlib1g-dev|"
+            "libslirp-dev|libslirp-dev|"
+            "meson|meson|meson"
+            "software-properties-common|software-properties-common|"
+            "genisoimage|genisoimage|genisoimage"
+            # LLVM BOLT deps (root mode only, non-fatal if missing) — cài đặt
+            # đa phiên bản được xử lý riêng ngay sau vòng lặp DEPS (xem dưới)
+            "linux-tools-generic|linux-tools-generic|perf"
+        )
+
+        TOTAL=${#DEPS[@]}; IDX=0
+        for entry in "${DEPS[@]}"; do
+            IFS='|' read -r label pkg chk <<< "$entry"
+            IDX=$(( IDX + 1 ))
+            if [[ -n "$chk" ]] && command -v "$chk" &>/dev/null; then continue; fi
+            if dpkg -s "$pkg" &>/dev/null 2>&1; then continue; fi
+            _rl_step "$IDX" "$TOTAL"
+            apt_install "$pkg" || true
+        done
+        _rl_ok "apt deps xong"
+
+        # ── LLVM BOLT: chỉ dò/cài khi người dùng bật --llvm-bolt ──────
+        # Trước đây khoá cứng "bolt-20", giờ dò theo BOLT_LLVM_VERSIONS
+        # để tương thích với các bản Ubuntu/Debian không có bolt-20
+        # (ví dụ chỉ có bolt-18 hoặc bolt-21 tuỳ repo).
+        if [[ "${BOLT_MODE:-0}" == "1" ]]; then
+            if [[ -z "$(_bolt_find_tool llvm-bolt 2>/dev/null)" ]]; then
+                echo -e "${B}ℹ${W}  Dò tìm gói LLVM BOLT khả dụng (thử ${BOLT_LLVM_VERSIONS[*]})..."
+                for _bv in "${BOLT_LLVM_VERSIONS[@]}"; do
+                    if command -v "llvm-bolt-${_bv}" &>/dev/null; then
+                        _rl_ok "Đã có llvm-bolt-${_bv}"
+                        break
+                    fi
+                    apt_install "bolt-${_bv}" &>/dev/null || true
+                    if command -v "llvm-bolt-${_bv}" &>/dev/null; then
+                        _rl_ok "Cài đặt thành công: bolt-${_bv} (llvm-bolt-${_bv})"
+                        break
+                    fi
+                done
+                if [[ -z "$(_bolt_find_tool llvm-bolt 2>/dev/null)" ]]; then
+                    _rl_warn "Không tìm/cài được gói LLVM BOLT (đã thử: ${BOLT_LLVM_VERSIONS[*]}) — BOLT sẽ bị bỏ qua"
+                fi
+            else
+                _rl_ok "LLVM BOLT sẵn có: $(_bolt_find_tool llvm-bolt)"
+            fi
+        fi
+
+        export CC="${CC:-gcc}"
+        export CXX="${CXX:-g++}"
+        LLD_AVAILABLE=0
+
+        GLIB_VER=$(pkg-config --modversion glib-2.0 2>/dev/null || echo "0.0.0")
+        if ver_lt "$GLIB_VER" "2.66"; then
+            _rl_warn "glib cũ — build 2.76.6"
+            :
+            silent sudo apt-get install -y libffi-dev gettext
+            cd /tmp; silent wget -q https://download.gnome.org/sources/glib/2.76/glib-2.76.6.tar.xz
+            :
+            :
+            if command -v xz &>/dev/null; then
+                silent tar -xf /tmp/glib-2.76.6.tar.xz -C /tmp
+            else
+                python3 -c "
+import lzma, tarfile, os
+os.chdir('/tmp')
+with lzma.open('glib-2.76.6.tar.xz') as f:
+    with tarfile.open(fileobj=f) as t:
+        t.extractall('.')
+" 2>/dev/null
+            fi
+            :
+            :
+            cd glib-2.76.6; silent meson setup build --prefix=/usr/local
+            silent ninja -C build; silent sudo ninja -C build install
+            _rl_ok "glib 2.76.6 xong"
+            export PKG_CONFIG_PATH="/usr/local/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+            export LD_LIBRARY_PATH="/usr/local/lib/x86_64-linux-gnu:/usr/local/lib:${LD_LIBRARY_PATH:-}"
+        else
+            echo -e "${G}✔ glib đủ yêu cầu: $GLIB_VER${W}"
+        fi
+
+        PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+        :
+        # Ưu tiên gói versioned (python3.X-venv) — bắt buộc với Python 3.12+ trên Ubuntu 24.04
+        VENV_PKG_VER="python${PY_VER}-venv"
+        VENV_PKG_GEN="python3-venv"
+        _venv_pkg_ok=0
+        dpkg -s "$VENV_PKG_VER" &>/dev/null 2>&1 && _venv_pkg_ok=1
+        dpkg -s "$VENV_PKG_GEN" &>/dev/null 2>&1 && _venv_pkg_ok=1
+        if [[ "$_venv_pkg_ok" == "0" ]]; then
+            echo -ne "${B}◜${W} Cài ${VENV_PKG_VER}..."
+            # Dùng $APT_CMD thay vì sudo apt-get (tránh sudo khi đã là root)
+            $APT_CMD install -y -qq "$VENV_PKG_VER" > /dev/null 2>&1 \
+                || $APT_CMD install -y -qq "$VENV_PKG_GEN" > /dev/null 2>&1 \
+                || true   # || true: không để set -e thoát nếu cả hai fail
+            echo -e "\r${G}✔${W} python venv packages cài xong          "
+        else
+            echo -e "${G}✔${W} python venv pkg đã có (${VENV_PKG_VER} hoặc ${VENV_PKG_GEN})"
+        fi
+
+        if [[ -d ~/qemu-env ]] && [[ -f ~/qemu-env/bin/activate ]]; then
+            echo -e "${G}✔${W} Python venv đã tồn tại — sử dụng lại"
+            _USE_VENV=1
+        else
+            echo -ne "${B}◜${W} Tạo python venv (~/qemu-env)..."
+            if python3 -m venv ~/qemu-env >/tmp/venv-create.log 2>&1 \
+                && [[ -f ~/qemu-env/bin/activate ]]; then
+                echo -e "\r${G}✔${W} Đã tạo venv tại ~/qemu-env          "
+                _USE_VENV=1
+            else
+                echo -e "\r${Y}⚠${W} Không tạo được venv (xem /tmp/venv-create.log) — dùng no-venv mode"
+                _USE_VENV=0
+            fi
+        fi
+
+        # Fix: PREFIX và PIP_TARGET chỉ được set trong _rootless_build.
+        # Trong root/apt mode các biến này chưa khai báo → set -u crash.
+        # Đặt fallback an toàn để PATH export không bị lỗi.
+        PREFIX="${PREFIX:-$HOME/qemu-static}"
+        PIP_TARGET="${PIP_TARGET:-$HOME/.local/lib/python-packages}"
+
+        if [[ "${_USE_VENV:-0}" == "1" ]]; then
+            source ~/qemu-env/bin/activate
+        else
+            export PATH="$PIP_TARGET/bin:$HOME/.local/bin:$PREFIX/bin:$PATH"
+            export PYTHONPATH="$PIP_TARGET${PYTHONPATH:+:$PYTHONPATH}"
+        fi
+
+        :
+        :
+        {
+            pip_install --upgrade pip tomli packaging
+            pip_install meson ninja
+            sudo apt-get remove -y meson 2>/dev/null || true
+            hash -r
+        } > /tmp/pip-install.log 2>&1
+        _rl_ok "meson / ninja sẵn sàng"
+        _qemu_build_tuning
+        EXTRA_CFLAGS="$QEMU_BASE_CFLAGS"
+        EXTRA_CXXFLAGS="$QEMU_BASE_CXXFLAGS"
+        EXTRA_LDFLAGS="$QEMU_BASE_LDFLAGS"
+        export CFLAGS="$EXTRA_CFLAGS"
+        export CXXFLAGS="$EXTRA_CXXFLAGS"
+        export LDFLAGS="$EXTRA_LDFLAGS"
+
+        if [[ ! -d /tmp/qemu-src ]]; then
+            spin_start "Tải source QEMU v11.0.0..."
+            silent git clone --depth 1 --branch v11.0.0 \
+                https://gitlab.com/qemu-project/qemu.git /tmp/qemu-src
+            spin_stop "Tải source QEMU xong"
+        else
+            echo -e "${G}✔ Source QEMU đã có tại /tmp/qemu-src — bỏ qua clone${W}"
+        fi
+
+        rm -rf /tmp/qemu-build
+        mkdir -p /tmp/qemu-build
+        cd /tmp/qemu-build
+
+        TCG_TB_COMPILE=$(( 256 * 1024 * 1024 ))
+
+        export CFLAGS="$EXTRA_CFLAGS"
+        export CXXFLAGS="$EXTRA_CXXFLAGS"
+        export LDFLAGS="$EXTRA_LDFLAGS"
+
+        # ── KVM flag cho configure apt-mode ──────────────────────
+        if [[ "$KVM_AVAILABLE" == "1" ]]; then
+            QEMU_KVM_FLAG="--enable-kvm"
+            echo -e "${G}⚡ QEMU apt-build: --enable-kvm${W}"
+        else
+            QEMU_KVM_FLAG="--disable-kvm"
+            echo -e "${B}ℹ${W}  QEMU apt-build: --disable-kvm (TCG mode)"
+        fi
+
+        # ── USB passthrough (usb-host cần libusb-1.0) ────────────
+        # Chỉ bật nếu tìm thấy dev headers, nếu không thì skip (giữ --disable-libusb như cũ)
+        if pkg-config --exists libusb-1.0 2>/dev/null || \
+           [[ -f /usr/include/libusb-1.0/libusb.h ]]; then
+            QEMU_LIBUSB_FLAG="--enable-libusb"
+            echo -e "${G}✔${W} libusb-1.0 tìm thấy — bật usb-host passthrough (--enable-libusb)"
+        else
+            QEMU_LIBUSB_FLAG="--disable-libusb"
+            echo -e "${Y}⚠${W}  libusb-1.0 không có — bỏ qua usb-host passthrough (cài libusb-1.0-0-dev để bật)"
+        fi
+
+        # ── Filesystem sharing (virtio-9p) ───────────────────────
+        # --enable-virtfs cần libcap-ng-dev (dùng để drop capability trước chroot).
+        # Nếu thiếu, ép --enable sẽ làm configure lỗi âm thầm → không sinh build.ninja
+        # → ninja compile fail với "loading 'build.ninja': No such file or directory".
+        # Vì vậy chỉ bật khi chắc chắn có dep, không thì skip (giữ --disable-virtfs).
+        if pkg-config --exists libcap-ng 2>/dev/null || \
+           [[ -f /usr/include/cap-ng.h ]]; then
+            QEMU_VIRTFS_FLAG="--enable-virtfs"
+            echo -e "${G}✔${W} libcap-ng tìm thấy — bật chia sẻ thư mục virtio-9p (--enable-virtfs)"
+        else
+            QEMU_VIRTFS_FLAG="--disable-virtfs"
+            echo -e "${Y}⚠${W}  libcap-ng không có — bỏ qua virtio-9p (cài libcap-ng-dev để bật)"
+        fi
+
+        # Bắt đầu tải image SONG SONG từ bước configure để tối đa hoá thời gian chạy song song
+        WIN_IMG_PATH="${ORIGINAL_DIR:-$(pwd)}/${WIN_IMG_PATH_BASE:-win.img}"
+        _start_parallel_download
+        [[ -n "$IMG_DL_PID" ]] && echo -e "${B}ℹ${W}  🔀 Tải image đang chạy nền (PID: $IMG_DL_PID) trong khi configure + compile..."
+        _rl_step 1 2 && :
+
+        if ../qemu-src/configure \
+            --prefix=/opt/qemu-optimized \
+            --target-list=x86_64-softmmu \
+            --enable-tcg \
+            $QEMU_KVM_FLAG \
+            --enable-slirp \
+            --enable-coroutine-pool \
+            --enable-vnc \
+            --disable-mshv \
+            --disable-xen \
+            --disable-gtk \
+            --disable-sdl \
+            --disable-spice \
+            --disable-plugins \
+            --disable-debug-info \
+            --disable-docs \
+            --disable-werror \
+            --disable-fdt \
+            --disable-vdi \
+            --disable-vvfat \
+            --disable-cloop \
+            --disable-dmg \
+            --disable-pa \
+            --disable-alsa \
+            --disable-oss \
+            --disable-jack \
+            --disable-gnutls \
+            --disable-smartcard \
+            $QEMU_LIBUSB_FLAG \
+            $QEMU_VIRTFS_FLAG \
+            --disable-seccomp \
+            --disable-modules \
+            -Dguest_agent=disabled \
+            -Dguest_agent_msi=disabled \
+            -Dtools=enabled \
+            --extra-cflags="$QEMU_BASE_CFLAGS" \
+            --extra-cxxflags="$QEMU_BASE_CXXFLAGS" \
+            --extra-ldflags="$QEMU_BASE_LDFLAGS" \
+            > /tmp/qemu-configure.log 2>&1; then
+            spin_stop "Configure xong"
+        else
+            echo -e "${R}✘ QEMU configure thất bại — xem /tmp/qemu-configure.log${W}"
+            tail -n 40 /tmp/qemu-configure.log 2>/dev/null || true
+            exit 1
+        fi
+
+        ulimit -n 84857 2>/dev/null || true
+        NCPU=$(nproc)
+
+        # ── Compile QEMU ─────────────────────────────────────
+        spin_start "Compile QEMU với ${NCPU} cores (mất 5-20 phút)..."
+        printf "[*] QEMU (system) compile started at %s
+" "$(date +%H:%M:%S)"
+( _hb=0; while :; do sleep 30; _hb=$((_hb+1)); printf "[~] QEMU compile: %d min...
+" "$((_hb/2))"; done ) & _HB_QSYS=$!
+if ninja -j"$NCPU" >> /tmp/qemu-build.log 2>&1; then
+  kill "$_HB_QSYS" 2>/dev/null; wait "$_HB_QSYS" 2>/dev/null || true; printf "[+] QEMU compile done
+"
+            spin_stop "Compile QEMU xong"
+        else
+            spin_fail "Compile QEMU thất bại — xem /tmp/qemu-build.log"
+            tail -30 /tmp/qemu-build.log >&2
+            exit 1
+        fi
+        echo -e "${G}🔥 Build hoàn tất: safe fast build${W}"
+
+        echo -e "${B}ℹ${W}  Cài đặt QEMU vào /opt/qemu-optimized..."
+        # Kiểm tra sudo trước để không bị treo chờ password
+        if [[ $EUID -eq 0 ]]; then
+            # Đang là root — cài thẳng
+            ninja install > /tmp/qemu-install.log 2>&1 \
+                && echo -e "${G}✔${W} Cài đặt QEMU xong (root)" \
+                || { echo -e "${R}✘${W} ninja install thất bại:"; tail -20 /tmp/qemu-install.log; exit 1; }
+        elif sudo -n true 2>/dev/null; then
+            # sudo không cần password
+            sudo ninja install > /tmp/qemu-install.log 2>&1 \
+                && echo -e "${G}✔${W} Cài đặt QEMU xong (sudo)" \
+                || { echo -e "${R}✘${W} ninja install thất bại:"; tail -20 /tmp/qemu-install.log; exit 1; }
+        else
+            # sudo cần password hoặc không có — cài vào $HOME thay thế
+            echo -e "${Y}⚠${W}  sudo không có hoặc cần password — cài vào ~/qemu-optimized thay thế"
+            mkdir -p ~/qemu-optimized
+            DESTDIR="" ninja install --destdir="" 2>/dev/null \
+                || MESON_INSTALL_DESTDIR_PREFIX="$HOME/qemu-optimized" ninja install \
+                    > /tmp/qemu-install.log 2>&1 \
+                || { echo -e "${R}✘${W} ninja install thất bại:"; tail -20 /tmp/qemu-install.log; exit 1; }
+            export PATH="$HOME/qemu-optimized/bin:$PATH"
+            export QEMU_BIN="$HOME/qemu-optimized/bin/qemu-system-x86_64"
+            echo -e "${G}✔${W} Cài đặt QEMU xong → ~/qemu-optimized"
+        fi
+
+        # Cập nhật QEMU_BIN sau khi cài xong (tránh trỏ vào path không tồn tại)
+        # Ưu tiên rootless path ($PREFIX, ~/qemu-static) trước opt/usr
+        for _qp in \
+            "${PREFIX:-}/bin/qemu-system-x86_64" \
+            "$HOME/qemu-static/bin/qemu-system-x86_64" \
+            "/opt/qemu-optimized/bin/qemu-system-x86_64" \
+            "$HOME/qemu-optimized/bin/qemu-system-x86_64" \
+            "/usr/bin/qemu-system-x86_64"; do
+            [[ -x "$_qp" ]] && { export QEMU_BIN="$_qp"; break; }
+        done
+        # Thêm bin dir của QEMU_BIN vào PATH (hoạt động đúng cả root lẫn rootless)
+        [[ -n "${QEMU_BIN:-}" ]] && export PATH="$(dirname "$QEMU_BIN"):$PATH"
+        echo -e "${G}🔥 QEMU build xong! $("$QEMU_BIN" --version 2>/dev/null | head -1 || echo '(ok)')${W}"
+        echo -e "   Accel: ${KVM_MODE^^}"
+
+    fi
+    # Đợi download nền (nếu đang chạy)
+    _wait_parallel_download
+else
+    echo -e "${Y}⚡ Bỏ qua build QEMU.${W}"
+    # Với --no-build, cần đảm bảo image sẵn sàng (download nếu cần)
+    _start_parallel_download
+    _wait_parallel_download
+fi
+
+# Đảm bảo bin dir của QEMU_BIN luôn có trong PATH (đúng cả root lẫn rootless)
 [[ -x "${QEMU_BIN:-}" ]] && export PATH="$(dirname "$QEMU_BIN"):$PATH"
 
 # ════════════════════════════════════════════════════════════════
@@ -2319,6 +3639,20 @@ esac
 
 if [[ "$WIN_NAME" == "Windows 10 LTSB 2022" ]]; then
     echo -e "${C}🎮${W} Image này đã được thiết lập sẵn hỗ trợ ${C}Winboxes VirtGPU 3D${W}"
+fi
+
+# ════════════════════════════════════════════════════════════════
+#  LLVM BOLT — PER-OS PROFILE SETUP
+#  Chỉ kích hoạt khi người dùng truyền cờ --llvm-bolt, ở root mode
+# ════════════════════════════════════════════════════════════════
+if [[ "${BOLT_MODE:-0}" == "1" ]]; then
+    # Chuẩn bị BOLT context theo Windows OS đã chọn
+    _bolt_prepare_context "${win_choice:-5}"
+
+    # LLVM BOLT chỉ hoạt động ở root mode (có apt), rootless mode tự động bỏ qua
+    if [[ "$ROOTLESS" != "1" ]] && [[ "$APT_OK" == "1" ]]; then
+        _bolt_prepare_instrumented "$QEMU_BIN" || true  # non-fatal nếu BOLT không khả dụng
+    fi
 fi
 
 # Kiểm tra win.img hợp lệ (tồn tại + không phải file rỗng/zero + >= 2GB)
@@ -2702,8 +4036,22 @@ else
     # Chạy tất cả TCG tuning
     _tcg_tune
 
-    # TCG TB cache — fixed 4096MB
-    TCG_TB_MB=4096
+    # TCG TB cache — size theo host RAM, tối đa 16384MB (giới hạn QEMU)
+    _host_ram_gb="${mem_total_gb:-$(awk '/MemTotal/{printf "%.0f",$2/1024/1024}' /proc/meminfo)}"
+    [[ "${_host_ram_gb:-0}" -lt 1 ]] && _host_ram_gb=4
+    # Dùng 12% host RAM cho TB cache, floor 4096MB, cap 16384MB
+    TCG_TB_MB=$(( _host_ram_gb * 1024 * 6 / 100 ))
+    [[ "$TCG_TB_MB" -lt 4096  ]] && TCG_TB_MB=4096
+    [[ "$TCG_TB_MB" -gt 8192 ]] && TCG_TB_MB=8192
+    # PGO generate phase: giảm tb-size xuống 256MB.
+    # Binary instrumented nặng hơn bình thường → TB cache lớn gây QEMU
+    # spend quá nhiều thời gian compile TB ở boot → treo/chậm cực đoan.
+    # 256MB đủ để boot + profile mà không bị stall.
+    if [[ "${PGO_MODE:-0}" == "1" && "${PGO_PHASE:-}" == "generate" ]]; then
+        TCG_TB_MB=256
+        echo -e "${Y}⚡ PGO generate: tb-size giảm xuống 256MB (tránh boot stall)${W}"
+        echo -e "${Y}⚠  Boot sẽ chậm hơn bình thường do PGO instrumentation — bình thường!${W}"
+    fi
     TCG_ACCEL_OPTS="thread=multi,split-wx=off,one-insn-per-tb=off,tb-size=$TCG_TB_MB"
     echo -e "${G}⚡ TCG TB cache: ${TCG_TB_MB}MB${W}"
     echo -e "${G}⚡ TCG accel: multi-thread + split-wx=off + one-insn-per-tb=off${W}"
@@ -3043,52 +4391,6 @@ fi
 # -nodefaults already disables serial/monitor; removed redundant -serial none -monitor none
 
 # ════════════════════════════════════════════════════════════════
-#  QEMU 11 APPIMAGE BACKEND STATUS (Rootless, TCG, LTO, -O3)
-# ════════════════════════════════════════════════════════════════
-echo ""
-echo -e "${C}══════════════════════════════════════════════${W}"
-echo -e "${C}🚀 WINBOXES-STABLE BACKEND STATUS${W}"
-echo -e "${C}══════════════════════════════════════════════${W}"
-
-# Resolve QEMU AppImage và kiểm tra thực tế
-_APP_BACKEND="$(_resolve_qemu_appimage 2>/dev/null || echo '')"
-_APP_VER=""
-_APP_BIN="$(_resolve_qemu_bin 2>/dev/null || echo '')"
-_APP_IMG="$(_resolve_qemu_appimage_img 2>/dev/null || echo '')"
-
-if [[ -n "$_APP_BACKEND" && -x "$_APP_BACKEND" ]]; then
-    _APP_VER=$(timeout 10 "$_APP_BACKEND" --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "unknown")
-    echo -e "⚙  QEMU Backend  : ${G}QEMU 11.x AppImage${W} (${_APP_VER})"
-    echo -e "📦 AppImage Path : ${B}${_APP_BACKEND}${W}"
-    echo -e "🔧 Mode          : ${G}Rootless${W} (no sudo, no apt, no system-wide QEMU)"
-    echo -e "🧠 Acceleration   : ${G}TCG available${W} (works without /dev/kvm)"
-    echo -e "⚡ Optimization   : ${G}-O3 + LTO baked-in${W} (build-time native CPU optimization)"
-    echo -e "📂 Runtime Data   : User-space ($HOME/.local/share/winboxes, $HOME/.cache/winboxes)"
-    echo -e "🎯 Fast Math      : Controlled (-ffast-math chỉ áp dụng cho TCG khi phù hợp)"
-    echo -e "💾 Firmware/Data  : Bundled in AppDir (BIOS/UEFI/ROM/keymaps/modules)"
-else
-    echo -e "⚙  QEMU Backend  : ${Y}AppImage not found — falling back${W}"
-fi
-
-if [[ -n "$_APP_BIN" && -n "$_APP_IMG" ]]; then
-    echo -e "📌 qemu-system-x86_64 : ${G}Bundled/resolvable${W}"
-    echo -e "📌 qemu-img         : ${G}Bundled/resolvable${W}"
-else
-    echo -e "📌 qemu-system-x86_64 : ${R}NOT RESOLVED${W}"
-    echo -e "📌 qemu-img         : ${R}NOT RESOLVED${W}"
-fi
-
-# Self-test
-if command -v bash &>/dev/null; then
-    echo -e "${C}──────────────────────────────────────────────${W}"
-    echo -e "${B}ℹ${W}  Running quick self-test..."
-    _qemu_appimage_selftest 2>/dev/null || echo -e "${Y}⚠${W} Self-test skipped (optional)"
-fi
-
-echo -e "${C}══════════════════════════════════════════════${W}"
-echo -e "${C}══════════════════════════════════════════════${W}"
-
-# ════════════════════════════════════════════════════════════════
 #  KHỞI ĐỘNG VM
 # ════════════════════════════════════════════════════════════════
 echo -e "${B}ℹ${W}  Khởi động VM ${WIN_NAME}..."
@@ -3098,41 +4400,14 @@ rm -f /tmp/qemu-launch.log 2>/dev/null || true
 ln -sf "$QEMU_LOG" /tmp/qemu-launch.log 2>/dev/null || true
 
 # ── Validate QEMU_BIN trước khi launch ──────────────────────────
-# Resolve lại QEMU_BIN theo thứ tự ưu tiên (AppImage first)
-RESOLVED_QEMU="$(_resolve_qemu_appimage 2>/dev/null || echo '')"
-if [[ -z "$RESOLVED_QEMU" || ! -x "$RESOLVED_QEMU" ]]; then
-    RESOLVED_QEMU="$(_resolve_qemu_bin)" || {
-        echo -e "${R}✘ Không tìm thấy qemu-system-x86_64!${W}"
-        echo -e "${Y}   Đảm bảo đã build QEMU trước khi chạy VM.${W}"
-        exit 1
-    }
-fi
+# Resolve lại QEMU_BIN theo thứ tự ưu tiên
+RESOLVED_QEMU=$(_resolve_qemu_bin) || {
+    echo -e "${R}✘ Không tìm thấy qemu-system-x86_64!${W}"
+    echo -e "${Y}   Đảm bảo đã build QEMU trước khi chạy VM.${W}"
+    exit 1
+}
 export QEMU_BIN="$RESOLVED_QEMU"
 QEMU_CMD[0]="$QEMU_BIN"
-
-# Nếu QEMU_BIN là AppImage, đảm bảo AppRun và paths đúng
-if [[ "$QEMU_BIN" == *"AppImage"* ]] || [[ -x "$QEMU_BIN" ]]; then
-    # Kiểm tra AppImage có thể chạy --version
-    if ! timeout 10 "$QEMU_BIN" --version >/dev/null 2>&1; then
-        echo -e "${R}✘${W} AppImage không chạy được (--version thất bại): $QEMU_BIN"
-        echo -e "${Y}💡${W} Thử: $QEMU_BIN --appimage-extract-and-run qemu-system-x86_64 --version"
-    else
-        echo -e "${G}✔${W} QEMU AppImage xác thực thành công (version OK)"
-    fi
-fi
-
-# Đảm bảo QEMU_IMG giải quyết đúng cho AppImage
-_RESOLVED_QEMU_IMG="$(_resolve_qemu_appimage_img 2>/dev/null || echo '')"
-if [[ -n "$_RESOLVED_QEMU_IMG" && -x "$_RESOLVED_QEMU_IMG" ]]; then
-    export QEMU_IMG="$_RESOLVED_QEMU_IMG"
-    echo -e "${G}✔${W} qemu-img resolved: ${_RESOLVED_QEMU_IMG}"
-else
-    # Fallback cho AppImage: dùng wrapper nội bộ
-    if [[ "$QEMU_BIN" == *"AppImage"* ]]; then
-        export QEMU_IMG="$QEMU_BIN"
-        echo -e "${G}✔${W} qemu-img dùng chung AppImage binary (bundled)"
-    fi
-fi
 echo -e "${G}✔${W} QEMU binary: $QEMU_BIN"
 
 # Build extra port forward string
@@ -3148,20 +4423,6 @@ echo "QEMU CMD: ${QEMU_CMD[*]}" > "$QEMU_LOG"
 
 # LAUNCH_PREFIX giữ nguyên giá trị từ _tcg_tune()
 
-
-# ── Khởi động VNC Boot Monitor (background, non-blocking) ──
-if [[ "${BOOTMON_ENABLED}" == "1" ]]; then
-    # Đảm bảo VNC server đang bật
-    if echo "${QEMU_CMD[*]}" | grep -q -i "vnc"; then
-        echo -e "${B}ℹ${W} Khởi động VNC Boot Monitor (background, non-blocking, Rootless)"
-        _bootmon_start_background || true
-    else
-        echo -e "${Y}⚠${W}  VNC không được bật cho VM này — Boot Monitor bị tắt"
-        BOOTMON_ENABLED=0
-    fi
-else
-    echo -e "${B}ℹ${W} VNC Boot Monitor tắt (BOOTMON_ENABLED=${BOOTMON_ENABLED})"
-fi
 
 # Rootless QEMU: đảm bảo LD_LIBRARY_PATH có lib path TRƯỚC khi fork
 if [[ "$QEMU_BIN" == *"qemu-static"* ]]; then
@@ -3210,6 +4471,40 @@ fi
 
 
 PUBLIC=""
+
+if [[ "${PGO_MODE:-0}" == "1" && "${PGO_PROFILE_READY:-0}" != "1" ]]; then
+    echo ""
+    echo -e "${C}══════════════════════════════════════════════${W}"
+    echo -e "${C}🧪 PGO TRAINING MODE${W}"
+    echo -e "${C}══════════════════════════════════════════════${W}"
+    echo -e "${B}ℹ${W}  Hãy vào VM và chạy vài workload nhẹ để QEMU học trước."
+    echo -e "${B}ℹ${W}  Profile sẽ được lưu tại: ${PGO_PROFILE_ARCHIVE}"
+    echo -e "${B}ℹ${W}  Khi xong, gõ ${G}continue${W} để dừng VM, lưu profile và build lại."
+    while true; do
+        read -rp "continue> " _pgo_reply || true  # || true tránh set -e kill script khi stdin là EOF/non-interactive
+        [[ "${_pgo_reply,,}" == "continue" ]] && break
+    done
+    echo -e "${B}ℹ${W}  Đang dừng VM để flush PGO profile..."
+    _pgo_stop_vm
+    _bolt_finalize_after_vm || true
+    if _pgo_finalize_profile; then
+        if [[ -f "$PGO_PROFILE_ARCHIVE" ]]; then
+            echo -e "${G}✔${W} PGO profile đã lưu: ${PGO_PROFILE_ARCHIVE}"
+            echo -e "${B}ℹ${W}  Đang build lại QEMU với profile vừa lưu..."
+            PGO_PROFILE_READY=1
+            PGO_PHASE="use"
+            PGO_MODE=1
+            export PGO_PROFILE_READY PGO_PHASE PGO_MODE
+            exec bash "$0" "${ORIGINAL_ARGS[@]}"
+        else
+            echo -e "${R}✘${W}  Không tạo được PGO archive: ${PGO_PROFILE_ARCHIVE}"
+            exit 1
+        fi
+    else
+        echo -e "${R}✘${W}  Finalize PGO profile thất bại — không build lại${W}"
+        exit 1
+    fi
+fi
 
 # ── SUMMARY ───────────────────────────────────────────────────────
 echo ""
